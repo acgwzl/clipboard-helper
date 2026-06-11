@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#f7f1e2"/>
+      <stop offset="100%" stop-color="#e7dcc1"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#fdfaf0"/>
+      <stop offset="100%" stop-color="#f5eedb"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#8a6a44"/>
+      <stop offset="100%" stop-color="#6d5234"/>
+    </linearGradient>
+    <filter id="soft" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
+      <feOffset dx="0" dy="8" result="o"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.18"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- 圆角米色底（应用图标外框） -->
+  <rect width="1024" height="1024" rx="220" ry="220" fill="url(#bg)"/>
+
+  <!-- 极淡的网格做纸的质感 -->
+  <g stroke="#8a6a44" stroke-width="1" opacity="0.06">
+    <line x1="0" y1="256" x2="1024" y2="256"/>
+    <line x1="0" y1="512" x2="1024" y2="512"/>
+    <line x1="0" y1="768" x2="1024" y2="768"/>
+    <line x1="256" y1="0" x2="256" y2="1024"/>
+    <line x1="512" y1="0" x2="512" y2="1024"/>
+    <line x1="768" y1="0" x2="768" y2="1024"/>
+  </g>
+
+  <!-- 内框（细金线 hairline） -->
+  <rect x="96" y="96" width="832" height="832" rx="40" ry="40"
+        fill="none" stroke="#8a6a44" stroke-width="3" opacity="0.35"/>
+
+  <!-- 后景纸（叠纸效果，露一角） -->
+  <g filter="url(#soft)">
+    <rect x="276" y="320" width="500" height="600" rx="20" ry="20"
+          fill="#f0e7cf" stroke="#8a6a44" stroke-width="4" opacity="0.7"
+          transform="rotate(-3 526 620)"/>
+  </g>
+
+  <!-- 主纸 -->
+  <g filter="url(#soft)">
+    <rect x="246" y="296" width="532" height="608" rx="22" ry="22"
+          fill="url(#paper)" stroke="#8a6a44" stroke-width="6"/>
+  </g>
+
+  <!-- 文字行（递减透明）-->
+  <g stroke="url(#ink)" stroke-width="14" stroke-linecap="round" fill="none">
+    <line x1="320" y1="470" x2="700" y2="470" opacity="0.92"/>
+    <line x1="320" y1="555" x2="610" y2="555" opacity="0.72"/>
+    <line x1="320" y1="640" x2="680" y2="640" opacity="0.55"/>
+    <line x1="320" y1="725" x2="560" y2="725" opacity="0.40"/>
+    <line x1="320" y1="810" x2="640" y2="810" opacity="0.28"/>
+  </g>
+
+  <!-- 顶部夹子 -->
+  <rect x="402" y="210" width="220" height="148" rx="34" ry="34"
+        fill="url(#ink)"/>
+  <rect x="432" y="240" width="160" height="88" rx="18" ry="18"
+        fill="url(#paper)"/>
+  <!-- 夹子上的小圆点 -->
+  <circle cx="512" cy="284" r="14" fill="url(#ink)" opacity="0.7"/>
+</svg>

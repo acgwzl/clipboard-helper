@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "剪贴板助手",
+  "version": "0.1.0",
+  "identifier": "com.pc.clipboard-helper",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "剪贴板助手",
+        "width": 1120,
+        "height": 720,
+        "minWidth": 900,
+        "minHeight": 600,
+        "maxWidth": 2200,
+        "maxHeight": 1600,
+        "visible": false,
+        "alwaysOnTop": false,
+        "decorations": false,
+        "skipTaskbar": true,
+        "resizable": true,
+        "center": true,
+        "transparent": false,
+        "shadow": true,
+        "focus": false,
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "publisher": "PC",
+    "category": "Productivity",
+    "shortDescription": "轻量剪贴板助手",
+    "longDescription": "基于 Tauri 的剪贴板历史管理工具，支持文本/图片/收藏/全局快捷键/自动粘贴。"
+  }
+}

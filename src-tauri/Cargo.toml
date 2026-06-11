@@ -1,0 +1,54 @@
+[package]
+name = "clipboard-helper"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "clipboard_helper_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri 核心
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-clipboard-manager = "2.3.2"
+tauri-plugin-global-shortcut = "2.3.1"
+tauri-plugin-opener = "2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 异步运行时
+tokio = { version = "1.52.3", features = ["full"] }
+
+# 持久化
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# 自动粘贴（键盘模拟）
+enigo = "0.2"
+
+# 窗口毛玻璃效果
+window-vibrancy = "0.5"
+
+# 时间戳
+chrono = { version = "0.4", features = ["serde"] }
+
+# 图片处理（用于把剪贴板原始像素编码为 PNG）
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# UUID 用于图片文件命名
+uuid = { version = "1", features = ["v4"] }
+
+# 文本工具栏
+base64 = "0.22"
+urlencoding = "2"
+md-5 = "0.10"
+
+# 导入导出文件对话框
+tauri-plugin-dialog = "2"
