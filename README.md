@@ -1,115 +1,22 @@
-# Clipboard Helper / 剪贴板助手
+# 剪贴板助手
 
-[中文说明](#中文说明)
+一个本地运行的剪贴板历史与快速粘贴工具，基于 Tauri 2、Vue 3、TypeScript 和 Rust 构建。
 
-Clipboard Helper is a local clipboard history and quick paste panel built with Tauri 2, Vue 3, TypeScript, and Rust.
+它会在后台记录系统剪贴板中的文本和图片，需要时通过快捷键唤出窗口，搜索、筛选、整理并快速粘贴历史内容。
 
-It runs in the background, records text and image clipboard entries, and lets you bring up a compact command-style window to search, organize, and paste previous clipboard content back into the current app.
+## 截图
 
-## Features
+### 主界面
 
-- Background clipboard monitoring for text and images
-- Text deduplication by content, with repeated text moved back to the top
-- Image capture as local PNG files
-- Global hotkey launcher, defaulting to `Ctrl+Shift+V`
-- Search across text and tags
-- Filters for item type, date, copy count, regular expressions, and case sensitivity
-- Tags, favorites, date grouping, and batch actions
-- Quick paste into the active application
-- Copy-only mode when auto-paste is not wanted
-- Image preview, link opening, JSON formatting, and domain copying
-- Compact mini mode and full management mode
-- Always-on-top toggle
-- 12 built-in themes
-- Privacy rules for ignored apps, sensitive window titles, and temporary pause
-- System tray menu with the latest 5 clipboard entries
-- JSON import and export
-- Usage statistics and top copied items
+![主界面](docs/screenshots/2026-06-11_110609_953.png)
 
-## Shortcuts
+### 主题切换
 
-| Shortcut | Action |
-|---|---|
-| `Ctrl+Shift+V` | Show or hide the app window. This can be changed in Settings. |
-| `Ctrl/Cmd + K` | Focus the search box. |
-| `Ctrl/Cmd + M` | Toggle mini mode. |
-| `Up` / `Down` | Move through the result list. |
-| `Enter` | Copy and auto-paste the selected item. |
-| `Ctrl + Enter` | Copy the selected item without auto-pasting. |
-| `Space` | Preview the selected item. |
-| `Tab` | Switch between All, Text, Images, and Favorites. |
-| `Esc` | Close dialogs, leave selection mode, or hide the main window. |
+![主题切换](docs/screenshots/ScreenShot_2026-06-11_110722_443.png)
 
-## Tech Stack
+### 设置与隐私规则
 
-- Tauri 2
-- Vue 3
-- TypeScript
-- Rust
-- SQLite via `rusqlite`
-
-## Development
-
-Install dependencies:
-
-```bash
-npm install
-```
-
-Start the Tauri development app:
-
-```bash
-npm run tauri dev
-```
-
-The main frontend file is `src/App.vue`.
-
-The main backend file is `src-tauri/src/lib.rs`.
-
-## Build
-
-Build a standalone executable:
-
-```bash
-npx tauri build --no-bundle
-```
-
-Build an NSIS installer:
-
-```bash
-npx tauri build --bundles nsis
-```
-
-More Windows packaging notes are available in `BUILD.md`.
-
-## Release Artifacts
-
-Local release files are placed in `release/`.
-
-The `release/` directory is ignored by Git. Upload release files through GitHub Releases instead of committing them to the repository.
-
-## Generated Files
-
-The following directories are generated and should not be committed:
-
-- `node_modules/`
-- `dist/`
-- `src-tauri/target/`
-- `release/`
-
-Run `npm install` before development or rebuilding after a clean checkout.
-
-## License
-
-This project is licensed under the terms in `LICENSE`.
-
----
-
-## 中文说明
-
-剪贴板助手是一个本地运行的剪贴板历史与快速粘贴工具，基于 Tauri 2、Vue 3、TypeScript 和 Rust 构建。
-
-它会在后台记录系统剪贴板中的文本和图片，需要时可以通过快捷键唤出一个类似命令面板的窗口，用来搜索、整理并快速粘贴历史内容。
+![设置与隐私规则](docs/screenshots/ScreenShot_2026-06-11_110739_786.png)
 
 ## 功能
 
@@ -187,7 +94,7 @@ npx tauri build --bundles nsis
 
 更详细的 Windows 打包说明见 `BUILD.md`。
 
-## 发布文件
+## 发布
 
 本地构建产物放在 `release/` 目录。
 
