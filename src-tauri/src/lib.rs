@@ -97,6 +97,14 @@ struct ActiveWindowInfo {
     process_name: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct OcrCrop {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
 struct AppState {
     db: Mutex<Connection>,
     last_hash: Mutex<u64>,
@@ -142,6 +150,7 @@ fn init_db(db_path: &PathBuf) -> rusqlite::Result<Connection> {
         let _ = conn.execute("ALTER TABLE clips ADD COLUMN copy_count INTEGER NOT NULL DEFAULT 0", []);
     }
     ensure_column(&conn, "clips", "tags", "TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(&conn, "clips", "sort_order", "INTEGER")?; // nullable,手动排序用
     ensure_column(&conn, "clips", "image_width", "INTEGER")?;
     ensure_column(&conn, "clips", "image_height", "INTEGER")?;
     ensure_column(&conn, "clips", "image_bytes", "INTEGER")?;
@@ -222,7 +231,7 @@ fn row_to_item(row: &rusqlite::Row) -> rusqlite::Result<ClipItem> {
 fn query_all_items(conn: &Connection) -> rusqlite::Result<Vec<ClipItem>> {
     let mut stmt = conn.prepare(
         "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes \
-         FROM clips ORDER BY pinned DESC, created_at DESC",
+         FROM clips ORDER BY pinned DESC, sort_order ASC NULLS LAST, created_at DESC",
     )?;
     let items = stmt
         .query_map([], row_to_item)?
@@ -664,6 +673,143 @@ fn simulate_paste() -> Result<(), String> {
     Ok(())
 }
 
+/// 把任意文本写入剪贴板（用于「合并选中」「转换并粘贴」等），存入历史并可选自动粘贴
+#[tauri::command]
+fn paste_text(
+    text: String,
+    auto_paste: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("空文本".to_string());
+    }
+    app.clipboard()
+        .write_text(text.clone())
+        .map_err(|e| e.to_string())?;
+    // 记录 hash，避免轮询把它当成新内容重复捕获
+    *state.last_hash.lock().unwrap() = hash_bytes(text.as_bytes());
+
+    // 合并/转换产生的新内容值得保留、可复用
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let _ = insert_text(&conn, &text);
+        let _ = prune_old(&conn);
+    }
+
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.hide();
+    }
+    if auto_paste {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(120));
+            let _ = simulate_paste();
+        });
+    }
+    Ok(())
+}
+
+/// 按给定顺序逐条写入剪贴板并模拟粘贴，每条之间间隔 delay_ms（用于「依次粘贴选中」填表）
+#[tauri::command]
+fn paste_sequence(
+    ids: Vec<i64>,
+    delay_ms: u64,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // 隐藏窗口前先把内容读好
+    let items: Vec<ClipItem> = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes \
+                 FROM clips WHERE id = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for id in &ids {
+            if let Ok(item) = stmt.query_row(params![id], row_to_item) {
+                out.push(item);
+            }
+        }
+        out
+    };
+    if items.is_empty() {
+        return Err("没有可粘贴的条目".to_string());
+    }
+
+    // 使用次数 +1
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        for id in &ids {
+            let _ = conn.execute(
+                "UPDATE clips SET copy_count = copy_count + 1 WHERE id = ?1",
+                params![id],
+            );
+        }
+    }
+
+    // 预记录最后一项 hash，减少序列结束后轮询重复入库
+    if let Some(last) = items.last() {
+        if last.content_type == "text" {
+            if let Some(t) = &last.text {
+                *state.last_hash.lock().unwrap() = hash_bytes(t.as_bytes());
+            }
+        }
+    }
+
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.hide();
+    }
+
+    // 命令运行在独立工作线程，阻塞睡眠不会冻结 UI；先等焦点回到目标应用
+    std::thread::sleep(Duration::from_millis(200));
+    let delay = delay_ms.clamp(50, 5000);
+    for (idx, item) in items.iter().enumerate() {
+        match item.content_type.as_str() {
+            "text" => {
+                if let Some(t) = &item.text {
+                    let _ = app.clipboard().write_text(t.clone());
+                }
+            }
+            "image" => {
+                if let Some(path) = &item.image_path {
+                    if let Ok(img) = load_image_for_clipboard(path) {
+                        let _ = app.clipboard().write_image(&img);
+                    }
+                }
+            }
+            _ => continue,
+        }
+        std::thread::sleep(Duration::from_millis(70)); // 等剪贴板写入生效
+        let _ = simulate_paste();
+        if idx + 1 < items.len() {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+    }
+    Ok(())
+}
+
+/// 在系统文件管理器中定位文件（Windows: explorer /select）
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    if !std::path::Path::new(&path).exists() {
+        return Err("路径不存在".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("当前平台暂不支持".to_string())
+    }
+}
+
 #[tauri::command]
 fn toggle_pin(id: i64, state: State<'_, AppState>) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -672,6 +818,32 @@ fn toggle_pin(id: i64, state: State<'_, AppState>) -> Result<(), String> {
         params![id],
     )
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 增加使用次数(片段替换后调用)
+#[tauri::command]
+fn increment_copy_count(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE clips SET copy_count = copy_count + 1 WHERE id = ?1",
+        params![id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 批量更新排序(拖拽后调用,传 id→sort_order 映射)
+#[tauri::command]
+fn update_sort_order(orders: Vec<(i64, i64)>, state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    for (id, order) in orders {
+        conn.execute(
+            "UPDATE clips SET sort_order = ?1 WHERE id = ?2",
+            params![order, id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -860,6 +1032,29 @@ fn add_text(text: String, state: State<'_, AppState>) -> Result<(), String> {
         let _ = prune_old(&conn);
     }
     Ok(())
+}
+
+/// 手动创建片段(不依赖剪贴板),pinned=true 便于筛选
+#[tauri::command]
+fn create_snippet(
+    text: String,
+    tags: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<i64, String> {
+    if text.trim().is_empty() {
+        return Err("片段内容不能为空".to_string());
+    }
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+    let now = Utc::now().timestamp_millis();
+    conn.execute(
+        "INSERT INTO clips (content_type, text, pinned, created_at, copy_count, tags) VALUES (?1, ?2, 1, ?3, 0, ?4)",
+        params!["text", &text, now, &tags_json],
+    )
+    .map_err(|e| e.to_string())?;
+    let id = conn.last_insert_rowid();
+    let _ = prune_old(&conn);
+    Ok(id)
 }
 
 #[tauri::command]
@@ -1249,6 +1444,158 @@ fn get_stats(state: State<'_, AppState>) -> Result<Stats, String> {
 // ================== 入口 ==================
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// ===================== OCR 文字识别 =====================
+#[cfg(target_os = "windows")]
+fn recognize_text_from_image_path(image_path: &str) -> Result<String, String> {
+    use windows::{
+        Media::Ocr::OcrEngine,
+        Graphics::Imaging::BitmapDecoder,
+        Storage::{StorageFile, FileAccessMode},
+        Globalization::Language,
+    };
+
+    let path_hstring = windows::core::HSTRING::from(image_path);
+    let file = StorageFile::GetFileFromPathAsync(&path_hstring)
+        .map_err(|e| format!("无法打开图片: {}", e))?
+        .get()
+        .map_err(|e| format!("文件访问失败: {}", e))?;
+
+    let stream = file.OpenAsync(FileAccessMode::Read)
+        .map_err(|e| format!("打开流失败: {}", e))?
+        .get()
+        .map_err(|e| format!("获取流失败: {}", e))?;
+
+    let decoder = BitmapDecoder::CreateAsync(&stream)
+        .map_err(|e| format!("解码失败: {}", e))?
+        .get()
+        .map_err(|e| format!("创建解码器失败: {}", e))?;
+
+    let bitmap = decoder.GetSoftwareBitmapAsync()
+        .map_err(|e| format!("获取位图失败: {}", e))?
+        .get()
+        .map_err(|e| format!("位图读取失败: {}", e))?;
+
+    // 使用中文 OCR 引擎(zh-Hans),如果失败回退到英文
+    let engine = Language::CreateLanguage(&windows::core::HSTRING::from("zh-Hans"))
+        .ok()
+        .and_then(|lang| OcrEngine::TryCreateFromLanguage(&lang).ok())
+        .or_else(|| OcrEngine::TryCreateFromUserProfileLanguages().ok())
+        .ok_or_else(|| "OCR 引擎初始化失败(需要 Windows 10 1903+)".to_string())?;
+
+    let result = engine.RecognizeAsync(&bitmap)
+        .map_err(|e| format!("OCR 识别失败: {}", e))?
+        .get()
+        .map_err(|e| format!("获取识别结果失败: {}", e))?;
+
+    let text = result.Text()
+        .map_err(|e| format!("提取文本失败: {}", e))?
+        .to_string();
+
+    if text.trim().is_empty() {
+        return Err("未识别到文字".to_string());
+    }
+
+    Ok(text)
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_ocr_image(image_path: &str, crop: Option<OcrCrop>) -> Result<PathBuf, String> {
+    use image::{ImageBuffer, Luma};
+
+    let mut img = image::open(image_path).map_err(|e| format!("图片读取失败: {}", e))?;
+    let img_w = img.width();
+    let img_h = img.height();
+    if img_w == 0 || img_h == 0 {
+        return Err("图片尺寸无效".to_string());
+    }
+
+    if let Some(crop) = crop {
+        let x = crop.x.min(img_w.saturating_sub(1));
+        let y = crop.y.min(img_h.saturating_sub(1));
+        let max_w = img_w.saturating_sub(x);
+        let max_h = img_h.saturating_sub(y);
+        let w = crop.width.min(max_w);
+        let h = crop.height.min(max_h);
+        if w < 2 || h < 2 {
+            return Err("选区太小，无法识别".to_string());
+        }
+        img = img.crop_imm(x, y, w, h);
+    }
+
+    let mut gray = img.to_luma8();
+    let (w, h) = gray.dimensions();
+    let mut min_v = u8::MAX;
+    let mut max_v = u8::MIN;
+    let mut sum: u64 = 0;
+    for p in gray.pixels() {
+        let v = p.0[0];
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+        sum += v as u64;
+    }
+
+    let total = (w as u64).saturating_mul(h as u64).max(1);
+    let avg = (sum / total) as u8;
+    let range = max_v.saturating_sub(min_v);
+    for p in gray.pixels_mut() {
+        let mut v = p.0[0];
+        if range > 16 {
+            v = (((v.saturating_sub(min_v)) as u32 * 255) / range as u32) as u8;
+        }
+        if avg < 128 {
+            v = 255u8.saturating_sub(v);
+        }
+        p.0[0] = v;
+    }
+
+    let max_dim = w.max(h).max(1);
+    let mut target_max = if max_dim < 700 {
+        max_dim.saturating_mul(4)
+    } else if max_dim < 1200 {
+        max_dim.saturating_mul(3)
+    } else if max_dim < 1800 {
+        max_dim.saturating_mul(2)
+    } else {
+        max_dim
+    };
+    target_max = target_max.min(3200);
+    let scale = (target_max as f32 / max_dim as f32).max(1.0);
+    let prepared = if scale > 1.05 {
+        let nw = ((w as f32 * scale).round() as u32).max(1);
+        let nh = ((h as f32 * scale).round() as u32).max(1);
+        image::imageops::resize(&gray, nw, nh, image::imageops::FilterType::CatmullRom)
+    } else {
+        gray
+    };
+
+    let (pw, ph) = prepared.dimensions();
+    let border = 24u32;
+    let mut canvas: ImageBuffer<Luma<u8>, Vec<u8>> =
+        ImageBuffer::from_pixel(pw + border * 2, ph + border * 2, Luma([255]));
+    image::imageops::overlay(&mut canvas, &prepared, border as i64, border as i64);
+
+    let path = std::env::temp_dir().join(format!("clipboard-helper-ocr-{}.png", uuid::Uuid::new_v4()));
+    canvas
+        .save_with_format(&path, image::ImageFormat::Png)
+        .map_err(|e| format!("OCR 临时图片保存失败: {}", e))?;
+    Ok(path)
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn extract_text_from_image(image_path: String, crop: Option<OcrCrop>) -> Result<String, String> {
+    let prepared_path = prepare_ocr_image(&image_path, crop)?;
+    let result = recognize_text_from_image_path(&prepared_path.to_string_lossy());
+    let _ = std::fs::remove_file(prepared_path);
+    result
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn extract_text_from_image(_image_path: String, _crop: Option<OcrCrop>) -> Result<String, String> {
+    Err("OCR 仅支持 Windows 10+".to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -1497,7 +1844,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_items,
             pick_item,
+            paste_text,
+            paste_sequence,
+            reveal_path,
             toggle_pin,
+            increment_copy_count,
+            update_sort_order,
             delete_item,
             clear_history,
             hide_window,
@@ -1510,11 +1862,13 @@ pub fn run() {
             pause_clipboard,
             read_image_as_data_url,
             add_text,
+            create_snippet,
             add_file_path,
             get_hotkey,
             set_hotkey,
             transform_text,
             replace_text,
+            extract_text_from_image,
             export_history,
             import_history,
             batch_delete,

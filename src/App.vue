@@ -5,6 +5,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import QRCode from "qrcode";
 
 interface ClipItem {
   id: number;
@@ -50,6 +51,13 @@ interface PrivacyStatus {
   blocking_reason: string | null;
 }
 
+interface OcrCrop {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 const THEMES: { id: Theme; name: string; color: string; kind: "light" | "dark" }[] = [
   { id: "light", name: "浅",   color: "#0c8a55", kind: "light" },
   { id: "biophilic", name: "生机", color: "#2f6f4e", kind: "light" },
@@ -75,6 +83,22 @@ const minCopies = ref<number>(0);
 const regexMode = ref(false);
 const caseSensitive = ref(false);
 const selectedTag = ref("");
+const autoTagFilter = ref("");
+const qrItem = ref<ClipItem | null>(null);
+const qrDataUrl = ref("");
+const ocrItem = ref<ClipItem | null>(null);
+const ocrText = ref("");
+const ocrBusy = ref(false);
+const ocrMessage = ref("");
+const ocrTool = ref<"select" | "pan">("select");
+const ocrSelection = ref<OcrCrop | null>(null);
+const ocrDragStart = ref<{ x: number; y: number } | null>(null);
+const ocrPanStart = ref<{ x: number; y: number; scrollLeft: number; scrollTop: number } | null>(null);
+const ocrImageEl = ref<HTMLImageElement | null>(null);
+const ocrViewport = ref<HTMLElement | null>(null);
+const ocrZoom = ref(1);
+const ocrBaseScale = ref(1);
+const ocrNaturalSize = ref({ width: 0, height: 0 });
 const advancedOpen = ref(localStorage.getItem("advancedOpen") === "true");
 const searchError = ref("");
 const VALID_THEMES: Theme[] = ["light", "biophilic", "fabric", "editorial", "mono", "softui", "swiss", "mono-dark", "graphite", "cobalt", "dusk", "midnight"];
@@ -83,6 +107,8 @@ const theme = ref<Theme>(storedTheme && VALID_THEMES.includes(storedTheme) ? sto
 const pinned = ref<boolean>(localStorage.getItem("pinned") === "true");
 const themePickerOpen = ref(false);
 const menuOpen = ref(false);
+const draggedItemId = ref<number | null>(null);
+const dropTargetId = ref<number | null>(null);
 const lightboxItem = ref<ClipItem | null>(null);
 const searchInput = ref<HTMLInputElement | null>(null);
 const imageCache = ref<Record<string, string>>({});
@@ -102,6 +128,11 @@ const statsOpen = ref(false);
 const helpOpen = ref(false);
 const tagEditorItem = ref<ClipItem | null>(null);
 const tagEditorText = ref("");
+
+// 新建片段 modal
+const snippetEditorOpen = ref(false);
+const snippetText = ref("");
+const snippetTags = ref("");
 const privacyStatus = ref<PrivacyStatus | null>(null);
 const ignoredAppsText = ref("");
 const sensitiveKeywordsText = ref("");
@@ -114,6 +145,28 @@ const hotkeyEditing = ref(false);
 const hotkeyError = ref("");
 
 const stats = ref<Stats | null>(null);
+
+const ocrSelectionStyle = computed(() => {
+  const s = ocrSelection.value;
+  if (!s) return {};
+  return {
+    left: `${s.x}px`,
+    top: `${s.y}px`,
+    width: `${s.width}px`,
+    height: `${s.height}px`,
+  };
+});
+const ocrStageStyle = computed(() => {
+  const natural = ocrNaturalSize.value;
+  if (!natural.width || !natural.height) return {};
+  const scale = ocrBaseScale.value * ocrZoom.value;
+  return {
+    width: `${Math.max(1, Math.round(natural.width * scale))}px`,
+    height: `${Math.max(1, Math.round(natural.height * scale))}px`,
+  };
+});
+const ocrZoomLabel = computed(() => `${Math.round(ocrZoom.value * 100)}%`);
+const hasOcrText = computed(() => ocrText.value.trim().length > 0);
 
 watch(theme, (v) => {
   document.documentElement.dataset.theme = v;
@@ -137,12 +190,18 @@ async function togglePinned() {
 
 const filtered = computed(() => {
   let list = items.value;
-  if (filter.value === "text") list = list.filter((i) => i.content_type === "text");
-  else if (filter.value === "image") list = list.filter((i) => i.content_type === "image");
-  else if (filter.value === "pinned") list = list.filter((i) => i.pinned);
+  if (filter.value === "pinned") {
+    list = list.filter((i) => i.pinned);
+  } else {
+    // 收藏项移出常规视图，只在「收藏」标签页展示，避免占满最近列表与小窗
+    list = list.filter((i) => !i.pinned);
+    if (filter.value === "text") list = list.filter((i) => i.content_type === "text");
+    else if (filter.value === "image") list = list.filter((i) => i.content_type === "image");
+  }
   if (timeFilter.value !== "any") list = list.filter((i) => timeMatches(i.created_at, timeFilter.value));
   if (minCopies.value > 0) list = list.filter((i) => (i.copy_count || 0) >= minCopies.value);
   if (selectedTag.value) list = list.filter((i) => (i.tags || []).some((t) => t.toLowerCase() === selectedTag.value.toLowerCase()));
+  if (autoTagFilter.value) list = list.filter((i) => autoTags(i).includes(autoTagFilter.value));
 
   const q = search.value.trim();
   searchError.value = "";
@@ -168,9 +227,9 @@ const filtered = computed(() => {
 });
 
 const counts = computed(() => ({
-  all: items.value.length,
-  text: items.value.filter((i) => i.content_type === "text").length,
-  image: items.value.filter((i) => i.content_type === "image").length,
+  all: items.value.filter((i) => !i.pinned).length,
+  text: items.value.filter((i) => !i.pinned && i.content_type === "text").length,
+  image: items.value.filter((i) => !i.pinned && i.content_type === "image").length,
   pinned: items.value.filter((i) => i.pinned).length,
 }));
 
@@ -195,7 +254,8 @@ const hasAdvancedFilters = computed(() =>
   minCopies.value > 0 ||
   regexMode.value ||
   caseSensitive.value ||
-  !!selectedTag.value
+  !!selectedTag.value ||
+  !!autoTagFilter.value
 );
 
 function resetAdvancedFilters() {
@@ -204,17 +264,20 @@ function resetAdvancedFilters() {
   regexMode.value = false;
   caseSensitive.value = false;
   selectedTag.value = "";
+  autoTagFilter.value = "";
 }
 
 const metrics = computed(() => {
   const d0 = new Date(); d0.setHours(0, 0, 0, 0);
   const t0 = d0.getTime();
-  let today = 0, copies = 0;
+  let today = 0, copies = 0, pinned = 0, image = 0;
   for (const it of items.value) {
     if (it.created_at >= t0) today++;
     copies += it.copy_count || 0;
+    if (it.pinned) pinned++;
+    if (it.content_type === "image") image++;
   }
-  return { today, pinned: counts.value.pinned, image: counts.value.image, copies };
+  return { today, pinned, image, copies };
 });
 
 function groupOf(ts: number): Group {
@@ -236,12 +299,9 @@ const grouped = computed(() => {
   const order: Group[] = ["今天", "昨天", "本周", "本月", "更早"];
   for (const g of order) map.set(g, []);
   for (const it of filtered.value) {
-    if (it.pinned) continue;
     map.get(groupOf(it.created_at))?.push(it);
   }
-  const pinnedList = filtered.value.filter((i) => i.pinned);
   const out: { name: string; items: ClipItem[] }[] = [];
-  if (pinnedList.length > 0) out.push({ name: "收藏", items: pinnedList });
   for (const g of order) {
     const arr = map.get(g)!;
     if (arr.length > 0) out.push({ name: g, items: arr });
@@ -346,6 +406,78 @@ async function saveTags() {
   await refresh();
 }
 
+function openSnippetEditor() {
+  snippetText.value = "";
+  snippetTags.value = "";
+  snippetEditorOpen.value = true;
+}
+
+async function saveSnippet() {
+  if (!snippetText.value.trim()) {
+    showToast("片段内容不能为空");
+    return;
+  }
+  const tags = snippetTags.value
+    .split(/[，,\n]/)
+    .map((t) => normalizeTag(t))
+    .filter(Boolean);
+  await invoke("create_snippet", { text: snippetText.value, tags });
+  snippetEditorOpen.value = false;
+  await refresh();
+  showToast("片段已创建");
+}
+
+// 拖拽排序(仅收藏视图)
+function onDragStart(item: ClipItem, e: DragEvent) {
+  if (!item.pinned) return; // 只允许收藏条目拖拽
+  draggedItemId.value = item.id;
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = "move";
+  }
+}
+
+function onDragOver(item: ClipItem, e: DragEvent) {
+  if (!draggedItemId.value || !item.pinned) return;
+  e.preventDefault();
+  dropTargetId.value = item.id;
+  if (e.dataTransfer) {
+    e.dataTransfer.dropEffect = "move";
+  }
+}
+
+function onDragLeave() {
+  dropTargetId.value = null;
+}
+
+async function onDrop(targetItem: ClipItem, e: DragEvent) {
+  e.preventDefault();
+  if (!draggedItemId.value || draggedItemId.value === targetItem.id) {
+    draggedItemId.value = null;
+    dropTargetId.value = null;
+    return;
+  }
+  // 重新排序:拖拽的条目移到目标位置
+  const pinnedItems = items.value.filter(it => it.pinned);
+  const dragIdx = pinnedItems.findIndex(it => it.id === draggedItemId.value);
+  const dropIdx = pinnedItems.findIndex(it => it.id === targetItem.id);
+  if (dragIdx === -1 || dropIdx === -1) return;
+
+  const [dragged] = pinnedItems.splice(dragIdx, 1);
+  pinnedItems.splice(dropIdx, 0, dragged);
+
+  // 生成新的 sort_order 映射(从0开始)
+  const orders: Array<[number, number]> = pinnedItems.map((it, idx) => [it.id, idx]);
+  await invoke("update_sort_order", { orders });
+  await refresh();
+  draggedItemId.value = null;
+  dropTargetId.value = null;
+}
+
+function onDragEnd() {
+  draggedItemId.value = null;
+  dropTargetId.value = null;
+}
+
 function normalizeTag(tag: string): string {
   return tag.trim().replace(/^#/, "").slice(0, 24);
 }
@@ -358,6 +490,17 @@ async function pickItem(item: ClipItem, autoPaste = true) {
   if (selectMode.value) {
     toggleSelect(item.id);
     return;
+  }
+  // 片段占位符替换:文本条目且含占位符 → 替换后用 paste_text
+  if (item.content_type === "text" && item.text) {
+    const placeholders = hasPlaceholders(item.text);
+    if (placeholders.length > 0) {
+      const replaced = await replacePlaceholders(item.text);
+      await invoke("paste_text", { text: replaced, autoPaste });
+      await invoke("increment_copy_count", { id: item.id });
+      await refresh();
+      return;
+    }
   }
   await invoke("pick_item", { id: item.id, autoPaste });
 }
@@ -416,6 +559,68 @@ async function batchPin(p: boolean) {
   const ids = [...selectedIds.value];
   if (ids.length === 0) return;
   await invoke("batch_pin", { ids, pinned: p });
+  selectedIds.value = new Set();
+  await refresh();
+}
+
+// 选中项按可视（flatIndexed）顺序排列的 id 列表
+function orderedSelectedIds(): number[] {
+  return flatIndexed.value.filter((i) => selectedIds.value.has(i.id)).map((i) => i.id);
+}
+
+// 前 9 条的 1-based 序号，用于 Alt+数字 快速粘贴的角标
+function quickIndex(item: ClipItem): number | null {
+  const i = flatIndexed.value.findIndex((x) => x.id === item.id);
+  return i >= 0 && i < 9 ? i + 1 : null;
+}
+
+// 占位符检测与替换
+function hasPlaceholders(text: string): string[] {
+  const found: string[] = [];
+  if (/\{\{date\}\}/i.test(text)) found.push("date");
+  if (/\{\{time\}\}/i.test(text)) found.push("time");
+  if (/\{\{clipboard\}\}/i.test(text)) found.push("clipboard");
+  return found;
+}
+
+async function replacePlaceholders(text: string): Promise<string> {
+  let out = text;
+  const now = new Date();
+  out = out.replace(/\{\{date\}\}/gi, now.toISOString().slice(0, 10)); // YYYY-MM-DD
+  out = out.replace(/\{\{time\}\}/gi, now.toTimeString().slice(0, 8)); // HH:MM:SS
+  // {{clipboard}} 从系统剪贴板读
+  if (/\{\{clipboard\}\}/i.test(out)) {
+    try {
+      const clip = await navigator.clipboard.readText();
+      out = out.replace(/\{\{clipboard\}\}/gi, clip);
+    } catch {
+      out = out.replace(/\{\{clipboard\}\}/gi, "");
+    }
+  }
+  return out;
+}
+
+// 合并选中项文本为一条并粘贴
+async function mergeSelected() {
+  const ids = orderedSelectedIds();
+  if (ids.length === 0) return;
+  const texts = ids
+    .map((id) => items.value.find((i) => i.id === id))
+    .filter((i): i is ClipItem => !!i && i.content_type === "text" && !!i.text)
+    .map((i) => i.text as string);
+  if (texts.length === 0) { showToast("选中项没有可合并的文本"); return; }
+  await invoke("paste_text", { text: texts.join("\n"), autoPaste: true });
+  selectMode.value = false;
+  selectedIds.value = new Set();
+  await refresh();
+}
+
+// 按可视顺序依次粘贴选中项到当前应用（填表）
+async function pasteSequence() {
+  const ids = orderedSelectedIds();
+  if (ids.length === 0) return;
+  await invoke("paste_sequence", { ids, delayMs: 250 });
+  selectMode.value = false;
   selectedIds.value = new Set();
   await refresh();
 }
@@ -652,6 +857,321 @@ function showToast(message: string) {
   dragDebug.value = message;
   setTimeout(() => { if (dragDebug.value === message) dragDebug.value = ""; }, 1800);
 }
+
+/* ===================== Track 3 内容智能 ===================== */
+function detectEmail(text: string | null | undefined): string | null {
+  if (!text) return null;
+  const m = text.trim().match(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/);
+  return m?.[0] || null;
+}
+function detectColor(text: string | null | undefined): string | null {
+  if (!text) return null;
+  const t = text.trim();
+  return /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$|^rgba?\([^)]*\)$|^hsla?\([^)]*\)$/.test(t) ? t : null;
+}
+function detectPath(text: string | null | undefined): string | null {
+  const t = (text || "").trim();
+  if (!t || /[\r\n]/.test(t)) return null;
+  if (/^[a-zA-Z]:\\/.test(t) || /^\\\\/.test(t)) return t;
+  return null;
+}
+function looksNumber(text: string | null | undefined): boolean {
+  const t = (text || "").trim();
+  if (!t || t.length > 40) return false;
+  return /^[+\-(]?\d[\d\s().,\-+]*$/.test(t) && (t.match(/\d/g)?.length || 0) >= 3;
+}
+
+// 虚拟自动标签：由检测器派生，不落库
+function autoTags(item: ClipItem): string[] {
+  if (item.content_type !== "text") return [];
+  const t = item.text || "";
+  const out: string[] = [];
+  if (detectUrl(t)) out.push("链接");
+  if (looksJson(t)) out.push("JSON");
+  if (detectCodeLanguage(t)) out.push("代码");
+  if (detectEmail(t)) out.push("邮箱");
+  if (detectColor(t)) out.push("颜色");
+  if (detectPath(t)) out.push("路径");
+  if (looksNumber(t)) out.push("数字");
+  return out;
+}
+function toggleAutoTag(name: string) {
+  autoTagFilter.value = autoTagFilter.value === name ? "" : name;
+}
+
+async function mailtoItem(item: ClipItem) {
+  const email = detectEmail(item.text);
+  if (!email) return;
+  try { await openUrl(`mailto:${email}`); } catch (e: any) { showToast("打开失败：" + e); }
+}
+async function revealItem(item: ClipItem) {
+  const p = detectPath(item.text);
+  if (!p) return;
+  try { await invoke("reveal_path", { path: p }); }
+  catch (e: any) { showToast("定位失败：" + e); }
+}
+
+// 二维码
+async function openQr(item: ClipItem) {
+  const text = item.content_type === "text" ? (item.text || "") : (item.image_path || "");
+  if (!text) { showToast("没有可生成的内容"); return; }
+  try {
+    qrDataUrl.value = await QRCode.toDataURL(text, { margin: 1, width: 260, errorCorrectionLevel: "M" });
+    qrItem.value = item;
+  } catch (e: any) {
+    showToast("内容过长，无法生成二维码");
+  }
+}
+
+async function ensureImageCached(item: ClipItem) {
+  if (!item.image_path || imageCache.value[item.image_path]) return;
+  imageCache.value[item.image_path] = await invoke<string>(
+    "read_image_as_data_url",
+    { path: item.image_path }
+  );
+}
+
+// OCR 文字识别：先弹窗确认，用户确认后再加入列表
+async function extractText(item: ClipItem) {
+  if (item.content_type !== "image" || !item.image_path) {
+    showToast("仅支持图片条目");
+    return;
+  }
+  try {
+    await ensureImageCached(item);
+    ocrItem.value = item;
+    ocrText.value = "";
+    ocrTool.value = "select";
+    ocrSelection.value = null;
+    ocrDragStart.value = null;
+    ocrPanStart.value = null;
+    ocrZoom.value = 1;
+    ocrBaseScale.value = 1;
+    ocrNaturalSize.value = { width: 0, height: 0 };
+    ocrMessage.value = "可拖动图片框选区域，或直接识别整图。";
+  } catch (e: any) {
+    showToast("图片加载失败: " + e);
+  }
+}
+
+function closeOcrDialog() {
+  if (ocrBusy.value) return;
+  ocrItem.value = null;
+  ocrText.value = "";
+  ocrTool.value = "select";
+  ocrSelection.value = null;
+  ocrDragStart.value = null;
+  ocrPanStart.value = null;
+  ocrZoom.value = 1;
+  ocrBaseScale.value = 1;
+  ocrNaturalSize.value = { width: 0, height: 0 };
+  ocrMessage.value = "";
+}
+
+function onOcrImageLoad(e: Event) {
+  const img = e.currentTarget as HTMLImageElement;
+  ocrNaturalSize.value = {
+    width: img.naturalWidth,
+    height: img.naturalHeight,
+  };
+  nextTick(() => fitOcrImage(false));
+}
+
+function fitOcrImage(keepSelection = true) {
+  const natural = ocrNaturalSize.value;
+  const viewport = ocrViewport.value;
+  if (!natural.width || !natural.height || !viewport) return;
+  const crop = keepSelection ? currentOcrCrop() : null;
+  const maxW = Math.max(220, viewport.clientWidth - 6);
+  const maxH = Math.max(220, viewport.clientHeight - 6);
+  ocrBaseScale.value = Math.min(1, maxW / natural.width, maxH / natural.height);
+  ocrZoom.value = 1;
+  restoreOcrCrop(crop);
+}
+
+function restoreOcrCrop(crop: OcrCrop | null) {
+  if (!crop) return;
+  nextTick(() => {
+    const img = ocrImageEl.value;
+    if (!img?.naturalWidth || !img.clientWidth) return;
+    const scale = img.clientWidth / img.naturalWidth;
+    ocrSelection.value = {
+      x: crop.x * scale,
+      y: crop.y * scale,
+      width: crop.width * scale,
+      height: crop.height * scale,
+    };
+  });
+}
+
+function setOcrZoom(next: number) {
+  const crop = currentOcrCrop();
+  ocrZoom.value = Math.max(0.5, Math.min(6, next));
+  restoreOcrCrop(crop);
+}
+
+function zoomOcr(delta: number) {
+  setOcrZoom(ocrZoom.value + delta);
+}
+
+function onOcrWheel(e: WheelEvent) {
+  if (!e.ctrlKey) return;
+  e.preventDefault();
+  zoomOcr(e.deltaY < 0 ? 0.25 : -0.25);
+}
+
+function setOcrTool(tool: "select" | "pan") {
+  if (ocrBusy.value) return;
+  ocrTool.value = tool;
+  ocrDragStart.value = null;
+  ocrPanStart.value = null;
+  ocrMessage.value = tool === "pan"
+    ? "拖动模式：按住图片平移，定位后可切回框选。"
+    : "框选模式：拖动图片区域画出要识别的范围。";
+}
+
+function ocrPoint(e: PointerEvent): { x: number; y: number } {
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  const x = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+  const y = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
+  return { x, y };
+}
+
+function startOcrPan(e: PointerEvent) {
+  const viewport = ocrViewport.value;
+  if (!viewport) return;
+  e.preventDefault();
+  ocrPanStart.value = {
+    x: e.clientX,
+    y: e.clientY,
+    scrollLeft: viewport.scrollLeft,
+    scrollTop: viewport.scrollTop,
+  };
+  (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+}
+
+function moveOcrPan(e: PointerEvent) {
+  const start = ocrPanStart.value;
+  const viewport = ocrViewport.value;
+  if (!start || !viewport) return;
+  viewport.scrollLeft = start.scrollLeft - (e.clientX - start.x);
+  viewport.scrollTop = start.scrollTop - (e.clientY - start.y);
+}
+
+function endOcrPan() {
+  if (ocrPanStart.value) {
+    ocrPanStart.value = null;
+  }
+}
+
+function onOcrSelectStart(e: PointerEvent) {
+  if (ocrBusy.value) return;
+  if (ocrTool.value === "pan" || e.button === 1) {
+    startOcrPan(e);
+    return;
+  }
+  if (e.button !== 0) return;
+  e.preventDefault();
+  const p = ocrPoint(e);
+  ocrDragStart.value = p;
+  ocrSelection.value = { x: p.x, y: p.y, width: 0, height: 0 };
+  (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+}
+
+function onOcrSelectMove(e: PointerEvent) {
+  if (ocrPanStart.value) {
+    moveOcrPan(e);
+    return;
+  }
+  if (!ocrDragStart.value || ocrBusy.value) return;
+  const p = ocrPoint(e);
+  const start = ocrDragStart.value;
+  ocrSelection.value = {
+    x: Math.min(start.x, p.x),
+    y: Math.min(start.y, p.y),
+    width: Math.abs(p.x - start.x),
+    height: Math.abs(p.y - start.y),
+  };
+}
+
+function onOcrSelectEnd(e: PointerEvent) {
+  if (ocrPanStart.value) {
+    endOcrPan();
+    return;
+  }
+  if (!ocrDragStart.value) return;
+  onOcrSelectMove(e);
+  ocrDragStart.value = null;
+  const s = ocrSelection.value;
+  if (!s || s.width < 8 || s.height < 8) {
+    ocrSelection.value = null;
+    ocrMessage.value = "选区太小，已取消。可重新拖动框选。";
+  } else {
+    ocrMessage.value = "选区已就绪，可以识别选区。";
+  }
+}
+
+function clearOcrSelection() {
+  ocrSelection.value = null;
+  ocrDragStart.value = null;
+  ocrMessage.value = "已清除选区，可识别整图或重新框选。";
+}
+
+function currentOcrCrop(): OcrCrop | null {
+  const s = ocrSelection.value;
+  const img = ocrImageEl.value;
+  if (!s || !img || !img.naturalWidth || !img.naturalHeight || !img.clientWidth || !img.clientHeight) {
+    return null;
+  }
+  const scaleX = img.naturalWidth / img.clientWidth;
+  const scaleY = img.naturalHeight / img.clientHeight;
+  return {
+    x: Math.max(0, Math.round(s.x * scaleX)),
+    y: Math.max(0, Math.round(s.y * scaleY)),
+    width: Math.max(1, Math.round(s.width * scaleX)),
+    height: Math.max(1, Math.round(s.height * scaleY)),
+  };
+}
+
+async function recognizeOcr(scope: "all" | "selection") {
+  const item = ocrItem.value;
+  if (!item?.image_path || ocrBusy.value) return;
+  const crop = scope === "selection" ? currentOcrCrop() : null;
+  if (scope === "selection" && !crop) {
+    ocrMessage.value = "请先在图片上拖动框选要识别的区域。";
+    return;
+  }
+  ocrBusy.value = true;
+  ocrMessage.value = scope === "selection" ? "正在识别选区..." : "正在识别整图...";
+  try {
+    ocrText.value = await invoke<string>("extract_text_from_image", {
+      imagePath: item.image_path,
+      crop,
+    });
+    ocrMessage.value = "请确认或编辑识别结果，然后加入列表。";
+  } catch (e: any) {
+    ocrMessage.value = e || "识别失败";
+  } finally {
+    ocrBusy.value = false;
+  }
+}
+
+async function addOcrText() {
+  const text = ocrText.value.trim();
+  if (!text || ocrBusy.value) return;
+  await invoke("add_text", { text });
+  closeOcrDialog();
+  await refresh();
+  showToast("识别文字已加入列表");
+}
+
+async function copyOcrText() {
+  const text = ocrText.value.trim();
+  if (!text) return;
+  await navigator.clipboard.writeText(text);
+  showToast("识别文字已复制");
+}
+
 async function winMin() { try { await getCurrentWindow().minimize(); } catch {} }
 async function winToggleMax() { try { await getCurrentWindow().toggleMaximize(); } catch {} }
 
@@ -742,6 +1262,14 @@ function onKeydown(e: KeyboardEvent) {
     if (e.key === "Escape") helpOpen.value = false;
     return;
   }
+  if (qrItem.value) {
+    if (e.key === "Escape") qrItem.value = null;
+    return;
+  }
+  if (ocrItem.value) {
+    if (e.key === "Escape") closeOcrDialog();
+    return;
+  }
   if (tagEditorItem.value) {
     if (e.key === "Escape") tagEditorItem.value = null;
     return;
@@ -778,6 +1306,24 @@ function onKeydown(e: KeyboardEvent) {
   const inField = !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
   if (inField && !inSearch) {
     if (e.key === "Escape" && el) el.blur();
+    return;
+  }
+
+  // Alt+1–9：快速粘贴对应序号的条目（带 Alt 修饰，焦点在搜索框也不冲突）
+  if (e.altKey && !e.ctrlKey && !e.metaKey && /^[1-9]$/.test(e.key)) {
+    const item = flatIndexed.value[parseInt(e.key, 10) - 1];
+    if (item) {
+      e.preventDefault();
+      pickItem(item, true);
+    }
+    return;
+  }
+
+  // “/” 聚焦搜索框
+  if (e.key === "/" && !inSearch) {
+    e.preventDefault();
+    searchInput.value?.focus();
+    searchInput.value?.select();
     return;
   }
 
@@ -837,7 +1383,7 @@ function relativeTime(ts: number): string {
 
 watch(filter, () => (selectedIndex.value = 0));
 watch(search, () => (selectedIndex.value = 0));
-watch([timeFilter, minCopies, regexMode, caseSensitive, selectedTag], () => (selectedIndex.value = 0));
+watch([timeFilter, minCopies, regexMode, caseSensitive, selectedTag, autoTagFilter], () => (selectedIndex.value = 0));
 
 onMounted(async () => {
   document.documentElement.dataset.theme = theme.value;
@@ -889,6 +1435,10 @@ listen("tauri://focus", () => {
       <symbol id="i-dots" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></symbol>
       <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.2 9.3a2.8 2.8 0 0 1 5.4 1c0 1.9-2.6 2.3-2.6 4"/><path d="M12 17.2v.01"/></symbol>
       <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><rect x="13" y="13" width="7" height="7" rx="1.5"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.2 4.2L19 7"/></symbol>
+      <symbol id="i-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/></symbol>
+      <symbol id="i-qr" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="M14 14h2v2h-2zM18 14h2v6h-6v-2h4zM14 18h2"/></symbol>
+      <symbol id="i-ocr" viewBox="0 0 24 24"><path d="M5 8V5h3M16 5h3v3M19 16v3h-3M8 19H5v-3"/><path d="M8 10h8M8 14h5"/></symbol>
     </svg>
 
     <!-- ===== 顶栏 ===== -->
@@ -905,7 +1455,7 @@ listen("tauri://focus", () => {
         <span class="lead" aria-hidden="true"><svg class="ic"><use href="#i-search"/></svg></span>
         <input ref="searchInput" v-model="search" class="cmd-input" placeholder="搜索、转换或粘贴…" />
         <span v-if="search" class="cmd-clear" @click="search = ''">×</span>
-        <span v-else class="kbd" aria-hidden="true">⌘K</span>
+        <span v-else class="kbd" aria-hidden="true">/</span>
       </div>
 
       <div class="top-actions">
@@ -939,6 +1489,7 @@ listen("tauri://focus", () => {
           </div>
         </div>
 
+        <button class="topbtn" @click="openSnippetEditor()" title="创建可复用片段"><svg class="ic"><use href="#i-star"/></svg>片段</button>
         <button class="topbtn icon" @click="helpOpen = true" title="帮助"><svg class="ic"><use href="#i-help"/></svg></button>
         <button class="topbtn icon" @click="loadPrivacyStatus(); settingsOpen = true" title="设置"><svg class="ic"><use href="#i-gear"/></svg></button>
         <button class="topbtn" @click="importAll()"><svg class="ic"><use href="#i-down"/></svg>导入</button>
@@ -1079,6 +1630,8 @@ listen("tauri://focus", () => {
       <button class="multi-btn" @click="selectAllVisible">全选</button>
       <button class="multi-btn" @click="selectNone">清选</button>
       <span class="multi-spacer"></span>
+      <button class="multi-btn" @click="mergeSelected" :disabled="selectedIds.size === 0" title="把选中项合并成一条并粘贴">合并粘贴</button>
+      <button class="multi-btn" @click="pasteSequence" :disabled="selectedIds.size === 0" title="按顺序逐条粘贴到当前应用">依次粘贴</button>
       <button class="multi-btn" @click="batchPin(true)" :disabled="selectedIds.size === 0">收藏</button>
       <button class="multi-btn" @click="batchPin(false)" :disabled="selectedIds.size === 0">取消收藏</button>
       <button class="multi-btn danger" @click="batchDelete" :disabled="selectedIds.size === 0">删除</button>
@@ -1095,9 +1648,16 @@ listen("tauri://focus", () => {
         <div
           v-for="item in (miniMode ? miniItems : filtered)"
           :key="item.id"
-          :class="['item', { selected: isSelected(item), pinned: item.pinned, 'multi-on': selectedIds.has(item.id) }]"
+          :class="['item', { selected: isSelected(item), pinned: item.pinned, 'multi-on': selectedIds.has(item.id), 'dragging': draggedItemId === item.id, 'drop-target': dropTargetId === item.id }]"
+          :draggable="filter === 'pinned' && item.pinned && !selectMode"
           @click="pickItem(item)"
+          @dragstart="onDragStart(item, $event)"
+          @dragover="onDragOver(item, $event)"
+          @dragleave="onDragLeave"
+          @drop="onDrop(item, $event)"
+          @dragend="onDragEnd"
         >
+          <span v-if="!miniMode && !selectMode && quickIndex(item)" class="quick-no" :title="`Alt+${quickIndex(item)} 快速粘贴`">{{ quickIndex(item) }}</span>
           <span class="glyph" aria-hidden="true">{{ typeGlyph(item) }}</span>
           <div class="item-main">
             <div class="item-title">
@@ -1127,6 +1687,15 @@ listen("tauri://focus", () => {
               <span v-if="item.pinned" class="pin-mark">已收藏</span>
             </div>
             <div class="item-tags">
+              <template v-if="!miniMode">
+                <span v-if="detectColor(item.text)" class="color-swatch" :style="{ background: detectColor(item.text) || undefined }" :title="detectColor(item.text) || ''"></span>
+                <button
+                  v-for="at in autoTags(item)"
+                  :key="'auto-' + at"
+                  :class="['auto-tag', { active: autoTagFilter === at }]"
+                  @click.stop="toggleAutoTag(at)"
+                >{{ at }}</button>
+              </template>
               <button
                 v-for="tag in (miniMode ? visibleTags(item, 2) : item.tags)"
                 :key="tag"
@@ -1143,7 +1712,7 @@ listen("tauri://focus", () => {
               :class="['iconbtn', 'check', { on: selectedIds.has(item.id) }]"
               @click.stop="toggleSelect(item.id)"
               title="勾选"
-            >{{ selectedIds.has(item.id) ? '✓' : '○' }}</button>
+            ><svg class="ic"><use :href="selectedIds.has(item.id) ? '#i-check' : '#i-circle'"/></svg></button>
             <button
               v-if="item.content_type === 'text' && !miniMode"
               class="iconbtn"
@@ -1169,6 +1738,30 @@ listen("tauri://focus", () => {
               title="复制域名"
             >域</button>
             <button
+              v-if="detectEmail(item.text) && !miniMode"
+              class="iconbtn"
+              @click.stop="mailtoItem(item)"
+              title="发送邮件"
+            >邮</button>
+            <button
+              v-if="detectPath(item.text) && !miniMode"
+              class="iconbtn"
+              @click.stop="revealItem(item)"
+              title="在文件夹中显示"
+            >夹</button>
+            <button
+              v-if="item.content_type === 'text' && item.text && !miniMode"
+              class="iconbtn qr-btn"
+              @click.stop="openQr(item)"
+              title="生成二维码"
+            ><svg class="ic"><use href="#i-qr"/></svg></button>
+            <button
+              v-if="item.content_type === 'image' && !miniMode"
+              class="iconbtn ocr-btn"
+              @click.stop="extractText(item)"
+              title="识别图片文字 (OCR)"
+            ><svg class="ic"><use href="#i-ocr"/></svg></button>
+            <button
               :class="['iconbtn', { on: item.pinned }]"
               @click.stop="togglePinClip(item)"
               :title="item.pinned ? '取消收藏' : '收藏'"
@@ -1191,6 +1784,7 @@ listen("tauri://focus", () => {
             :class="['item', { selected: isSelected(item), pinned: item.pinned, 'multi-on': selectedIds.has(item.id) }]"
             @click="pickItem(item)"
           >
+            <span v-if="!selectMode && quickIndex(item)" class="quick-no" :title="`Alt+${quickIndex(item)} 快速粘贴`">{{ quickIndex(item) }}</span>
             <span class="glyph" aria-hidden="true">{{ typeGlyph(item) }}</span>
             <div class="item-main">
               <div class="item-title">
@@ -1220,6 +1814,13 @@ listen("tauri://focus", () => {
                 <span v-if="item.pinned" class="pin-mark">已收藏</span>
               </div>
               <div class="item-tags">
+                <span v-if="detectColor(item.text)" class="color-swatch" :style="{ background: detectColor(item.text) || undefined }" :title="detectColor(item.text) || ''"></span>
+                <button
+                  v-for="at in autoTags(item)"
+                  :key="'auto-' + at"
+                  :class="['auto-tag', { active: autoTagFilter === at }]"
+                  @click.stop="toggleAutoTag(at)"
+                >{{ at }}</button>
                 <button
                   v-for="tag in item.tags"
                   :key="tag"
@@ -1236,7 +1837,7 @@ listen("tauri://focus", () => {
                 :class="['iconbtn', 'check', { on: selectedIds.has(item.id) }]"
                 @click.stop="toggleSelect(item.id)"
                 title="勾选"
-              >{{ selectedIds.has(item.id) ? '✓' : '○' }}</button>
+              ><svg class="ic"><use :href="selectedIds.has(item.id) ? '#i-check' : '#i-circle'"/></svg></button>
               <button
                 v-if="item.content_type === 'text'"
                 class="iconbtn"
@@ -1262,6 +1863,30 @@ listen("tauri://focus", () => {
                 title="复制域名"
               >域</button>
               <button
+                v-if="detectEmail(item.text)"
+                class="iconbtn"
+                @click.stop="mailtoItem(item)"
+                title="发送邮件"
+              >邮</button>
+              <button
+                v-if="detectPath(item.text)"
+                class="iconbtn"
+                @click.stop="revealItem(item)"
+                title="在文件夹中显示"
+              >夹</button>
+              <button
+                v-if="item.content_type === 'text' && item.text"
+                class="iconbtn qr-btn"
+                @click.stop="openQr(item)"
+                title="生成二维码"
+              ><svg class="ic"><use href="#i-qr"/></svg></button>
+              <button
+                v-if="item.content_type === 'image'"
+                class="iconbtn ocr-btn"
+                @click.stop="extractText(item)"
+                title="识别图片文字 (OCR)"
+              ><svg class="ic"><use href="#i-ocr"/></svg></button>
+              <button
                 :class="['iconbtn', { on: item.pinned }]"
                 @click.stop="togglePinClip(item)"
                 :title="item.pinned ? '取消收藏' : '收藏'"
@@ -1280,7 +1905,7 @@ listen("tauri://focus", () => {
       <span class="foot-ok"><span class="foot-dot"></span> 本地数据库</span>
       <span class="foot-status">{{ selectMode ? `已选 ${selectedIds.size} 条` : '就绪' }}</span>
       <span v-if="dragDebug" class="drag-debug">{{ dragDebug }}</span>
-      <span class="foot-hints"><kbd>↑↓</kbd> 选择 · <kbd>↵</kbd> 复制 · <kbd>␣</kbd> 预览 · <kbd>⇥</kbd> 切换 · <kbd>⌘K</kbd> 搜索</span>
+      <span class="foot-hints"><kbd>↑↓</kbd> 选择 · <kbd>↵</kbd> 复制 · <kbd>⌥1-9</kbd> 速粘 · <kbd>⌘K</kbd>/<kbd>/</kbd> 搜索</span>
       <span class="count">{{ flatIndexed.length }} / {{ items.length }}</span>
     </footer>
 
@@ -1300,6 +1925,88 @@ listen("tauri://focus", () => {
         </div>
       </div>
       <div class="lightbox-hint">Esc 关闭 ‧ ↵ 粘贴</div>
+    </div>
+
+    <!-- OCR 识别确认 -->
+    <div v-if="ocrItem" class="modal-bg" @click="closeOcrDialog">
+      <div class="modal ocr-modal" @click.stop>
+        <div class="modal-head">
+          <span>识别图片文字</span>
+          <button class="icon-btn close" @click="closeOcrDialog">×</button>
+        </div>
+        <div class="modal-body ocr-body">
+          <div class="ocr-preview">
+            <div class="ocr-toolbar">
+              <button :class="['setting-btn', { active: ocrTool === 'select' }]" :disabled="ocrBusy" @click="setOcrTool('select')">框选</button>
+              <button :class="['setting-btn', { active: ocrTool === 'pan' }]" :disabled="ocrBusy" @click="setOcrTool('pan')">拖动图片</button>
+              <button class="setting-btn" :disabled="ocrBusy" @click="fitOcrImage()">适合窗口</button>
+              <button class="setting-btn" :disabled="ocrBusy" @click="zoomOcr(-0.25)">缩小</button>
+              <span class="ocr-zoom-label">{{ ocrZoomLabel }}</span>
+              <button class="setting-btn" :disabled="ocrBusy" @click="zoomOcr(0.25)">放大</button>
+            </div>
+            <div
+              v-if="ocrItem.image_path && imageCache[ocrItem.image_path]"
+              ref="ocrViewport"
+              class="ocr-image-viewport"
+              @wheel="onOcrWheel"
+            >
+              <div
+                :class="['ocr-image-stage', { 'pan-mode': ocrTool === 'pan', panning: !!ocrPanStart }]"
+                :style="ocrStageStyle"
+                @pointerdown="onOcrSelectStart"
+                @pointermove="onOcrSelectMove"
+                @pointerup="onOcrSelectEnd"
+                @pointercancel="onOcrSelectEnd"
+              >
+                <img
+                  ref="ocrImageEl"
+                  :src="imageCache[ocrItem.image_path]"
+                  class="ocr-image"
+                  draggable="false"
+                  alt=""
+                  @load="onOcrImageLoad"
+                />
+                <div v-if="ocrSelection" class="ocr-selection" :style="ocrSelectionStyle"></div>
+              </div>
+            </div>
+            <div class="ocr-hint">先放大，再用「拖动图片」平移定位；切回「框选」后拖出识别区域。Ctrl+滚轮也可缩放。</div>
+            <div class="ocr-actions">
+              <button class="setting-btn primary" :disabled="ocrBusy" @click="recognizeOcr('all')">识别整图</button>
+              <button class="setting-btn" :disabled="ocrBusy || !ocrSelection" @click="recognizeOcr('selection')">识别选区</button>
+              <button class="setting-btn" :disabled="ocrBusy || !ocrSelection" @click="clearOcrSelection">清除选区</button>
+            </div>
+          </div>
+          <div class="ocr-result">
+            <div class="setting-label">识别结果</div>
+            <textarea
+              v-model="ocrText"
+              class="setting-textarea ocr-textarea"
+              placeholder="识别后会显示在这里，你可以先确认或编辑，再加入列表。"
+              :disabled="ocrBusy"
+            ></textarea>
+            <div class="ocr-message">{{ ocrMessage }}</div>
+            <div class="modal-actions">
+              <button class="setting-btn" :disabled="ocrBusy" @click="closeOcrDialog">取消</button>
+              <button class="setting-btn" :disabled="ocrBusy || !hasOcrText" @click="copyOcrText">复制文字</button>
+              <button class="setting-btn primary" :disabled="ocrBusy || !hasOcrText" @click="addOcrText">加入列表</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 二维码 -->
+    <div v-if="qrItem" class="modal-bg" @click="qrItem = null">
+      <div class="modal qr-modal" @click.stop>
+        <div class="modal-head">
+          <span>二维码</span>
+          <button class="icon-btn close" @click="qrItem = null">×</button>
+        </div>
+        <div class="modal-body qr-body">
+          <img v-if="qrDataUrl" :src="qrDataUrl" class="qr-img" alt="二维码" />
+          <div class="qr-text">{{ preview(qrItem.text, 120) }}</div>
+        </div>
+      </div>
     </div>
 
     <!-- 设置 -->
@@ -1422,6 +2129,30 @@ listen("tauri://focus", () => {
       </div>
     </div>
 
+    <!-- 新建片段 modal -->
+    <div v-if="snippetEditorOpen" class="modal-bg" @click="snippetEditorOpen = false">
+      <div class="modal snippet-modal" @click.stop>
+        <div class="modal-head">
+          <span>新建片段</span>
+          <button class="icon-btn close" @click="snippetEditorOpen = false">×</button>
+        </div>
+        <div class="modal-body">
+          <label class="setting-row">
+            <span class="setting-label">内容</span>
+            <textarea v-model="snippetText" class="setting-textarea" placeholder="输入片段内容，支持占位符：{{date}} {{time}} {{clipboard}}" rows="6" @keydown.ctrl.enter="saveSnippet"></textarea>
+          </label>
+          <label class="setting-row">
+            <span class="setting-label">标签</span>
+            <input v-model="snippetTags" class="setting-input" placeholder="邮件签名, SQL, 常用回复" @keydown.enter="saveSnippet" />
+          </label>
+          <div class="modal-actions">
+            <button class="setting-btn" @click="snippetEditorOpen = false">取消</button>
+            <button class="setting-btn primary" @click="saveSnippet">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 帮助 -->
     <div v-if="helpOpen" class="modal-bg" @click="helpOpen = false">
       <div class="modal help" @click.stop>
@@ -1440,6 +2171,8 @@ listen("tauri://focus", () => {
             <table class="help-table">
               <tr><td><kbd>Ctrl + Shift + V</kbd></td><td>默认全局唤起快捷键，可在「设置」修改</td></tr>
               <tr><td><kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>K</kbd></td><td>聚焦搜索框</td></tr>
+              <tr><td><kbd>/</kbd></td><td>聚焦搜索框</td></tr>
+              <tr><td><kbd>Alt</kbd> + <kbd>1</kbd>–<kbd>9</kbd></td><td>快速粘贴对应序号的条目</td></tr>
               <tr><td><kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>M</kbd></td><td>切换小窗 / 完整模式</td></tr>
               <tr><td><kbd>↑</kbd> <kbd>↓</kbd></td><td>上下选择</td></tr>
               <tr><td><kbd>↵</kbd></td><td>复制并自动粘贴选中条目</td></tr>
@@ -1458,10 +2191,36 @@ listen("tauri://focus", () => {
               <li><b>↗</b>：打开检测到的链接</li>
               <li><b>{}</b>：格式化 JSON 并复制结果</li>
               <li><b>域</b>：复制链接域名</li>
-              <li><b>★</b>：收藏 / 取消收藏</li>
+              <li><b>邮</b>：用默认邮件客户端打开检测到的邮箱</li>
+              <li><b>夹</b>：在文件夹中定位检测到的本地路径</li>
+              <li><b>二维码</b>：为文本条目生成二维码</li>
+              <li><b>识别</b>：图片条目可打开 OCR 确认弹窗</li>
+              <li><b>收藏</b>：收藏 / 取消收藏</li>
               <li><b>+ 标签</b>：编辑标签，标签可在左侧或小窗顶部筛选</li>
               <li><b>×</b>：删除该条</li>
             </ul>
+          </section>
+
+          <section class="help-sec">
+            <h3 class="help-h">图片文字识别</h3>
+            <ul class="help-ul">
+              <li><b>识别整图</b>：对整张图片执行 OCR，结果先显示在弹窗中</li>
+              <li><b>框选</b>：拖动图片画出区域，再点「识别选区」</li>
+              <li><b>拖动图片</b>：放大后按住图片平移，定位后切回「框选」</li>
+              <li><b>缩放</b>：使用放大 / 缩小按钮，或按住 Ctrl 滚动鼠标滚轮</li>
+              <li><b>确认</b>：可先编辑识别结果，再复制文字或加入列表</li>
+            </ul>
+          </section>
+
+          <section class="help-sec">
+            <h3 class="help-h">片段占位符</h3>
+            <p class="help-p">点击顶栏「片段」按钮可手动创建可复用文本片段(如邮件签名、常用回复、SQL 模板)。片段内容支持占位符,粘贴时自动替换：</p>
+            <table class="help-table">
+              <tr><td><code v-pre>{{date}}</code></td><td>替换为当前日期 (YYYY-MM-DD)</td></tr>
+              <tr><td><code v-pre>{{time}}</code></td><td>替换为当前时间 (HH:MM:SS)</td></tr>
+              <tr><td><code v-pre>{{clipboard}}</code></td><td>替换为系统剪贴板当前内容</td></tr>
+            </table>
+            <p class="help-p">示例: <code v-pre>会议记录 {{date}} - {{clipboard}}</code> 粘贴时变为 <code>会议记录 2026-06-22 - [剪贴板内容]</code></p>
           </section>
 
           <section class="help-sec">
@@ -1534,7 +2293,6 @@ listen("tauri://focus", () => {
 
 <style>
 /* ===== 主题：纯净中性灰（Linear / Vercel 风） ===== */
-/* ===== 主题：command-palette（纯实色无模糊） ===== */
 :root {
   --radius: 6px;
   --radius-sm: 4px;
@@ -2276,6 +3034,26 @@ h1 {
   width: 3px; border-radius: 0 2px 2px 0; background: var(--accent);
 }
 .item.multi-on { border-color: var(--accent); background: var(--accent-soft); }
+.item.dragging { opacity: 0.5; cursor: grabbing; }
+.item.drop-target { border-color: var(--accent); border-style: dashed; background: var(--accent-soft); }
+.item[draggable="true"] { cursor: grab; }
+
+/* Alt+1–9 快速粘贴角标 */
+.quick-no {
+  position: absolute; top: 6px; right: 8px; z-index: 1;
+  min-width: 14px; height: 15px; padding: 0 3px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  font-size: 9.5px; line-height: 1; font-weight: 600;
+  color: var(--text-tertiary);
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  transition: opacity var(--transition);
+}
+.item:hover .quick-no { opacity: 0; }
 
 .glyph {
   width: 30px; height: 30px;
@@ -2700,6 +3478,107 @@ h1 {
   outline: none;
 }
 .setting-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.setting-textarea {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--panel-soft);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+}
+.setting-textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.ocr-modal {
+  width: min(860px, 94vw);
+}
+.ocr-body {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(260px, 340px);
+  gap: 16px;
+}
+.ocr-preview {
+  min-width: 0;
+}
+.ocr-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.ocr-zoom-label {
+  min-width: 44px;
+  text-align: center;
+  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.ocr-image-viewport {
+  width: 100%;
+  height: min(56vh, 520px);
+  min-height: 280px;
+  overflow: auto;
+  background: var(--panel-soft);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+.ocr-image-stage {
+  position: relative;
+  display: block;
+  min-width: 1px;
+  min-height: 1px;
+  margin: 0 auto;
+  overflow: hidden;
+  cursor: crosshair;
+  user-select: none;
+  touch-action: none;
+}
+.ocr-image-stage.pan-mode { cursor: grab; }
+.ocr-image-stage.panning { cursor: grabbing; }
+.ocr-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  pointer-events: none;
+}
+.ocr-selection {
+  position: absolute;
+  border: 2px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.32);
+  pointer-events: none;
+}
+.ocr-hint,
+.ocr-message {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
+.ocr-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.ocr-result {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.ocr-textarea {
+  min-height: 260px;
+  resize: vertical;
+}
+.setting-btn:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
 .privacy-box {
   display: flex; flex-direction: column; gap: 8px;
   padding: 10px;
@@ -2738,6 +3617,7 @@ h1 {
   transition: all var(--transition);
 }
 .setting-btn:hover { color: var(--accent); border-color: var(--accent); }
+.setting-btn.active { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .setting-btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 .setting-btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 .setting-error { margin-top: 6px; font-size: 11px; color: #c04030; }
@@ -2850,6 +3730,7 @@ h1 {
   .side-bottom { margin-top: 12px; }
   .history { min-height: 320px; }
   .sub { display: none; }
+  .ocr-body { grid-template-columns: 1fr; }
 }
 
 /* ===== 主题微调（仅个别皮肤需要的组件级处理） ===== */
@@ -2874,5 +3755,36 @@ h1 {
 /* swiss / editorial（含深色版）：硬朗描边主导，强调色块选中态更醒目 */
 [data-theme="swiss"] .item.selected,
 [data-theme="editorial"] .item.selected { box-shadow: var(--shadow-sm); }
+
+/* ===== Track 3 自动标签 / 色块 / 二维码 ===== */
+.auto-tag {
+  font-size: 10.5px; line-height: 1;
+  padding: 3px 6px; border-radius: 999px;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  cursor: pointer;
+  transition: color var(--transition), background var(--transition), border-color var(--transition);
+}
+.auto-tag:hover { color: var(--accent); border-color: var(--accent); }
+.auto-tag.active { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); border-style: solid; }
+.color-swatch {
+  width: 13px; height: 13px; border-radius: 3px;
+  border: 1px solid var(--border-strong);
+  display: inline-block; flex-shrink: 0; align-self: center;
+}
+.qr-modal { width: min(320px, 90vw); }
+.qr-body { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+.qr-img {
+  width: 220px; height: 220px;
+  image-rendering: pixelated;
+  background: #fff; padding: 8px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+.qr-text {
+  font-size: 11px; color: var(--text-tertiary);
+  word-break: break-all; text-align: center;
+  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+}
 
 </style>
