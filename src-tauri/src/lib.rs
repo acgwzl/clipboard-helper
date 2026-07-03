@@ -231,7 +231,7 @@ fn row_to_item(row: &rusqlite::Row) -> rusqlite::Result<ClipItem> {
 fn query_all_items(conn: &Connection) -> rusqlite::Result<Vec<ClipItem>> {
     let mut stmt = conn.prepare(
         "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes \
-         FROM clips ORDER BY pinned DESC, sort_order ASC NULLS LAST, created_at DESC",
+         FROM clips ORDER BY sort_order ASC NULLS LAST, created_at DESC",
     )?;
     let items = stmt
         .query_map([], row_to_item)?

@@ -193,8 +193,7 @@ const filtered = computed(() => {
   if (filter.value === "pinned") {
     list = list.filter((i) => i.pinned);
   } else {
-    // 收藏项移出常规视图，只在「收藏」标签页展示，避免占满最近列表与小窗
-    list = list.filter((i) => !i.pinned);
+    // 收藏项在普通视图也显示
     if (filter.value === "text") list = list.filter((i) => i.content_type === "text");
     else if (filter.value === "image") list = list.filter((i) => i.content_type === "image");
   }
@@ -227,9 +226,9 @@ const filtered = computed(() => {
 });
 
 const counts = computed(() => ({
-  all: items.value.filter((i) => !i.pinned).length,
-  text: items.value.filter((i) => !i.pinned && i.content_type === "text").length,
-  image: items.value.filter((i) => !i.pinned && i.content_type === "image").length,
+  all: items.value.length,
+  text: items.value.filter((i) => i.content_type === "text").length,
+  image: items.value.filter((i) => i.content_type === "image").length,
   pinned: items.value.filter((i) => i.pinned).length,
 }));
 
