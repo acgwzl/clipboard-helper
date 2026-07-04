@@ -2913,13 +2913,15 @@ h1 {
   font-family: var(--font-mono);
   font-size: 11px; color: var(--text-tertiary);
 }
-.queue { flex: 1; overflow-y: auto; padding: 2px 10px 10px; }
+.queue { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 2px 10px 10px; }
 .mini-strip {
   display: flex; align-items: center; gap: 6px;
   padding: 0 8px 6px;
   overflow-x: auto;
   flex-shrink: 0;
+  scrollbar-width: none; /* 标签条滚轮即可横移,不显示滚动条 */
 }
+.mini-strip::-webkit-scrollbar { display: none; }
 .mini-tag {
   height: 22px;
   max-width: 82px;
@@ -3356,7 +3358,7 @@ h1 {
   color: var(--text-secondary);
 }
 
-::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
