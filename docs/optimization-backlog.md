@@ -24,9 +24,8 @@ pick_item 与 paste_sequence 的图片哈希已改为解码后 RGBA(与轮询同
 ### 6. 500ms 盲轮询 ⏳ 部分完成(c26050e:序列号门控 + 去 to_vec)
 已加 `GetClipboardSequenceNumber()` 门控——内容未变的 tick 直接跳过(隐私查库/读图/哈希全部省掉);两处哈希去掉了多余的 `to_vec()` 拷贝。**剩余可选**:message-only 窗口 + `AddClipboardFormatListener` 彻底事件驱动(收益已大幅降低)。
 
-### 7. 图片无缩略图 + base64 IPC + imageCache 无淘汰
-[lib.rs:596-605](../src-tauri/src/lib.rs#L596) 全尺寸 PNG → base64(膨胀 1.33×)→ IPC;前端 [App.vue:114](../src/App.vue#L114) `imageCache` 只增不减、删除条目也不清理,几十张截图 = 数百 MB 常驻内存;列表 60px 缩略图背着 4K 全图解码。
-**改法**:入库时生成最长边 ~320px 缩略图(`{uuid}.thumb.png`,clips 表加 thumb_path),列表用缩略图;进一步开启 assetProtocol(scope 限 images 目录)+ `convertFileSrc`,base64 通道与 imageCache 整体删除。
+### 7. ~~图片无缩略图 + base64 IPC + imageCache 无淘汰~~ ✅ 已修复(b6bddcf,2026-07-04)
+入库生成 320px 缩略图(thumb_path 列,启动时为旧图后台补生成);前端全部 convertFileSrc 走 asset 协议(scope 限 $APPDATA/images),列表用缩略图、灯箱/OCR 用原图;imageCache/预载/淘汰与 read_image_as_data_url 命令整体删除。
 
 ### 8. clips-changed 全量刷新,窗口隐藏时也照跑
 每次捕获 emit → 前端 `refresh()` 全表 `get_items`(无 LIMIT、含完整正文,单条可达 64KB)→ 整列表重渲染([App.vue:1394](../src/App.vue#L1394)、[lib.rs:590](../src-tauri/src/lib.rs#L590))。
@@ -44,9 +43,8 @@ pick_item 与 paste_sequence 的图片哈希已改为解码后 RGBA(与轮询同
 `update_sort_order` 拖一次 = 200 个独立事务([lib.rs:838-848](../src-tauri/src/lib.rs#L838));import/batch_delete/batch_pin/prune_old 同样逐条 autocommit;持 Mutex 期间全部命令排队。
 **改法**:`init_db` 后执行 `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`;循环写包进单事务;`prune_old` 可换成一条 `DELETE ... WHERE id NOT IN (... LIMIT 200) RETURNING image_path`。
 
-### 12. refresh 串行逐张加载图片,每张触发一次全列表重渲染
-[App.vue:333-342](../src/App.vue#L333) for+await 逐张 IPC;imageCache 每新增一个 key 就全组件重渲染一次。
-**改法**:并发(限 4-6)+ 结果攒齐后一次性 `Object.assign`;改 asset 协议后此路径整体消失。
+### 12. ~~refresh 串行逐张加载图片,每张触发一次全列表重渲染~~ ✅ 已随 #7 消灭(b6bddcf)
+base64 加载路径整体删除,图片由 WebView 经 asset 协议按需加载。
 
 ### 13. 30 秒定时器:隐藏时空转,隐私状态无谓轮询
 [App.vue:1399-1403](../src/App.vue#L1399) `now` tick 触发全列表重渲染,窗口藏在托盘也不停;`loadPrivacyStatus` 只有设置弹窗展示却常年轮询(后端还要查 Win32 前台窗口)。
