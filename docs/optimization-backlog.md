@@ -4,9 +4,8 @@
 
 ## P0 · 正确性 bug(建议最先修)
 
-### 1. ~~选取图片条目必然重复入库~~ ✅ 已修复(c26050e,2026-07-04)
-pick_item 与 paste_sequence 的图片哈希已改为解码后 RGBA(与轮询同数据源)。长期项仍可选:给 clips 表加 image_hash 列做图片内容去重。
-
+### 1. ~~选取图片条目必然重复入库~~ ✅ 已修复(c26050e)+ 长期项也已完成(96bd91d)
+哈希改 RGBA 同源;新增 image_hash 列(RGBA md5)+索引,轮询/拖入/导入三条入库路径全部内容级去重。
 ### 2. ~~老化清理泄漏图片文件~~ ✅ 已修复(c26050e,2026-07-04)
 `prune_old` 现在删行的同时 `fs::remove_file` 删 PNG;启动时 `cleanup_orphan_images` 清扫 images 目录中无 DB 记录引用的孤儿文件,自动回收旧版本泄漏的空间。
 
@@ -52,19 +51,12 @@ simulate_paste 前用 GetAsyncKeyState 轮询等 Ctrl/Shift/Alt/Win 全部物理
 ### 17. ~~小窗模式下所有 toast 不可见~~ ✅ 已修复(c9d7693:toast 拆为固定定位浮层挂 .app 根部,与 dragDebug 分离)
 ### 18. ~~破坏性操作用原生 confirm()/alert()~~ ✅ 已修复(c9d7693:应用内确认框 askConfirm(Enter 确定/Esc 取消)+ 全局 toast,6 处原生弹窗全部替换)
 ### 19. ~~正则搜索语义不对称~~ ✅ 已修复(90f2230:正则与普通搜索同 haystack(正文+标签),图片条目可按标签搜到)
-### 20. 导出不带图片、导入产生共享文件的多行,删除互相误伤
-export 只写含绝对路径的 JSON;import 时路径存在才收、且直接引用原文件不复制([lib.rs:1346](../src-tauri/src/lib.rs#L1346))——重复导入产生多行指向同一 PNG,`delete_item` 又会物理删文件,删一条把别条的图也删没。
-**改法**:导出 zip(data.json + images/)或内嵌 base64 选项;导入把图片复制进 images_dir 换新 uuid,按内容哈希去重。
-
-## P3 · 配置 / 工程卫生
-
-### 21. ~~字体走 Google Fonts CDN~~ ✅ 已完成(2026-07-04)+ CSP 仍为 null
-字体已改 @fontsource 本地打包(main.ts 引入 ibm-plex-sans 400-700 / zilla-slab 600-700 / courier-prime 400-700 / noto-serif-sc 700),CDN link 已从 index.html 删除,离线渲染有保证;代价:exe 13MB→21MB(Noto Serif SC 子集占大头,且 fontsource CSS 同时引用 woff+woff2,可再瘦身)。**遗留**:[tauri.conf.json:36](../src-tauri/tauri.conf.json#L36) CSP 仍为 null,建议补显式 CSP(img-src 需含 data: 供缩略图/二维码)。
-
-### 22. 开机自启未实现
-剪贴板工具的核心价值依赖常驻,重启后不手动打开就漏采。
-**改法**:接 tauri-plugin-autostart,设置面板加开关;主窗口本就 visible:false,自启后天然静默驻留托盘。
-
+### 20. ~~导出不带图片、导入产生共享文件的多行,删除互相误伤~~ ✅ 已修复(96bd91d)
+导出 v2 内嵌图片 base64(自包含);导入统一解码后复制成本库新文件(v1 回退读路径),按 image_hash 内容去重,不再引用外部路径。
+### 21. ~~字体走 Google Fonts CDN~~ ✅ 已完成 + ~~CSP null~~ ✅ 已补显式 CSP(96bd91d)
+字体 @fontsource 本地打包;CSP 显式白名单:self + ipc + asset 协议 + data: 图源(供二维码),style 允许内联(Vue 需要)。
+### 22. ~~开机自启未实现~~ ✅ 已完成(96bd91d)
+接入 tauri-plugin-autostart(Rust 侧 get/set_autostart 命令),设置面板新增开关;主窗口本就 visible:false,自启后静默驻留托盘。
 ### 23. ~~死依赖清理~~ ✅ 已完成(c9d7693)
 npm 移除 @vueuse/core、@tauri-apps/plugin-clipboard-manager、@tauri-apps/plugin-global-shortcut;Cargo 移除 window-vibrancy,tokio 特性 full→time。
 ### 24. ~~杂项修正~~ ✅ 已全部完成(c9d7693 + 90f2230)
