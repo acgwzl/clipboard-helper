@@ -27,28 +27,22 @@ pick_item 与 paste_sequence 的图片哈希已改为解码后 RGBA(与轮询同
 ### 7. ~~图片无缩略图 + base64 IPC + imageCache 无淘汰~~ ✅ 已修复(b6bddcf,2026-07-04)
 入库生成 320px 缩略图(thumb_path 列,启动时为旧图后台补生成);前端全部 convertFileSrc 走 asset 协议(scope 限 $APPDATA/images),列表用缩略图、灯箱/OCR 用原图;imageCache/预载/淘汰与 read_image_as_data_url 命令整体删除。
 
-### 8. clips-changed 全量刷新,窗口隐藏时也照跑
-每次捕获 emit → 前端 `refresh()` 全表 `get_items`(无 LIMIT、含完整正文,单条可达 64KB)→ 整列表重渲染([App.vue:1394](../src/App.vue#L1394)、[lib.rs:590](../src-tauri/src/lib.rs#L590))。
-**改法**:事件携带增量 payload 就地插入;或至少 SELECT 用 `substr(text,1,500)` 只传预览 + 按需取全文;隐藏时置 dirty 标志、显示时刷一次;refresh 加 300ms debounce。
+### 8. clips-changed 全量刷新 ⏳ 部分完成(0540b75:300ms 防抖 + 隐藏标脏、显示补刷)
+**剩余可选**:事件携带增量 payload 就地插入;SELECT 只传 `substr(text,1,500)` 预览 + 按需取全文(与 #9 一起做收益更大)。
 
 ### 9. 列表渲染:每行十余个派生函数全量重算 + O(n²) 序号查找
 每行模板调 `highlightedParts`(每行重编译正则)、`looksJson`(全文 JSON.parse ×3 次/行)、`preview`(全文正则替换)等([App.vue:1646](../src/App.vue#L1646) 起);`quickIndex` 每行 `findIndex` 全表扫描([App.vue:571](../src/App.vue#L571)),200 条一次渲染 ≈ 6-12 万次比较;且每个按键/方向键/30s tick 都触发整列表重渲染。
 **改法**:派生元数据做成 `computed Map<id, meta>` 查表;正则用 computed 缓存单实例;序号用 v-for 的 index;行内容套 `v-memo`;最后一步可用已安装的 @vueuse/core `useVirtualList` 只渲染可视行。
 
-### 10. OCR 阻塞 async runtime worker
-`extract_text_from_image` 是 async 但内部全是同步重活:逐像素预处理、3200px 重采样、5 处 WinRT `.get()` 阻塞([lib.rs:1586](../src-tauri/src/lib.rs#L1586)、1458-1488、1525-1569)。OCR 期间轮询和其它命令可能被卡。
-**改法**:整体包进 `tauri::async_runtime::spawn_blocking`,数行改动。
+### 10. ~~OCR 阻塞 async runtime worker~~ ✅ 已修复(0540b75:整体挪入 spawn_blocking)
 
-### 11. 多行写操作无事务、未开 WAL
-`update_sort_order` 拖一次 = 200 个独立事务([lib.rs:838-848](../src-tauri/src/lib.rs#L838));import/batch_delete/batch_pin/prune_old 同样逐条 autocommit;持 Mutex 期间全部命令排队。
-**改法**:`init_db` 后执行 `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`;循环写包进单事务;`prune_old` 可换成一条 `DELETE ... WHERE id NOT IN (... LIMIT 200) RETURNING image_path`。
+### 11. ~~多行写操作无事务、未开 WAL~~ ✅ 已修复(0540b75)
+init_db 开启 WAL + synchronous=NORMAL;update_sort_order / batch_pin / batch_delete / import_history 循环写全部改单事务(unchecked_transaction)。prune_old 单次通常只删 1 行,保持原样。
 
 ### 12. ~~refresh 串行逐张加载图片,每张触发一次全列表重渲染~~ ✅ 已随 #7 消灭(b6bddcf)
 base64 加载路径整体删除,图片由 WebView 经 asset 协议按需加载。
 
-### 13. 30 秒定时器:隐藏时空转,隐私状态无谓轮询
-[App.vue:1399-1403](../src/App.vue#L1399) `now` tick 触发全列表重渲染,窗口藏在托盘也不停;`loadPrivacyStatus` 只有设置弹窗展示却常年轮询(后端还要查 Win32 前台窗口)。
-**改法**:`visibilitychange` 时暂停/恢复;privacy 轮询只在设置弹窗打开期间进行。
+### 13. ~~30 秒定时器:隐藏时空转,隐私状态无谓轮询~~ ✅ 已修复(0540b75:隐藏时跳过 tick;隐私状态仅设置弹窗打开期间轮询)
 
 ## P2 · 可靠性 / 交互
 
