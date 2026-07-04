@@ -46,26 +46,15 @@ base64 加载路径整体删除,图片由 WebView 经 asset 协议按需加载�
 
 ## P2 · 可靠性 / 交互
 
-### 14. 自动粘贴:固定 120ms 赌焦点 + 物理 Shift 未松开会触发自家全局热键
-[lib.rs:658-663](../src-tauri/src/lib.rs#L658) sleep(120ms) 后 enigo 发 Ctrl+V;用户用 Ctrl+Shift+V 唤起后快速回车时,物理 Shift 仍按着 → 系统收到 Ctrl+Shift+V = 本应用热键,窗口又弹回来。
-**改法**:粘贴前用 `GetAsyncKeyState` 等修饰键全部物理松开(带超时,Ditto 的标准做法);以"前台窗口不再是本应用"代替固定 sleep。
-
+### 14. ~~自动粘贴:固定 120ms 赌焦点 + 物理 Shift 未松开会触发自家全局热键~~ ✅ 已修复(c9d7693)
+simulate_paste 前用 GetAsyncKeyState 轮询等 Ctrl/Shift/Alt/Win 全部物理松开(超时 1.5s)再发 Ctrl+V。
 ### 15. 轮询任务锁中毒即静默死亡;insert 失败内容无声丢失
 轮询内 6 处 `.lock().unwrap()`([lib.rs:1769](../src-tauri/src/lib.rs#L1769) 起),任何命令线程持锁 panic 后下一 tick 轮询 panic 且不重启——捕获从此停摆无日志。且先更新 last_hash 再 `let _ = insert_text(...)`,失败既不入库也不重试。
 **改法**:`lock().unwrap_or_else(|p| p.into_inner())` 或换 parking_lot;insert 成功后才更新 last_hash;循环体隔离单 tick 失败。
 
-### 16. 托盘「清空未收藏历史」零确认,一次误点物理删除全部
-[lib.rs:1691-1696](../src-tauri/src/lib.rs#L1691) 直接 `clear_history`(删记录+删图片文件),与「显示窗口」「退出」相邻;应用内同功能有 confirm,托盘裸奔。
-**改法**:用已装的 plugin-dialog 弹 ask 确认;或 show 窗口 + emit 事件由前端弹主题化确认框。
-
-### 17. 小窗模式下所有 toast 不可见
-`showToast` 写入的 `dragDebug` 只渲染在 `<footer v-if="!miniMode">` 里([App.vue:1903-1906](../src/App.vue#L1903)),小窗恰是拖拽/快贴最常用形态,操作成败零反馈。
-**改法**:toast 拆成独立固定定位浮层挂 .app 根部;dragDebug(调试)与 toast(反馈)分成两个变量。
-
-### 18. 破坏性操作用原生 confirm()/alert()
-clearAll/batchDelete/导入导出结果([App.vue:519](../src/App.vue#L519)、552、635-651)弹 WebView2 系统框,与 12 套主题割裂,且 Tauri 不保证各平台可用(confirm 恒 false 时静默失败)。
-**改法**:复用现有 modal 体系做应用内确认,或 plugin-dialog 的 ask()/message()。
-
+### 16. ~~托盘「清空未收藏历史」零确认~~ ✅ 已修复(c9d7693:plugin-dialog 原生警告确认,独立线程 blocking_show)
+### 17. ~~小窗模式下所有 toast 不可见~~ ✅ 已修复(c9d7693:toast 拆为固定定位浮层挂 .app 根部,与 dragDebug 分离)
+### 18. ~~破坏性操作用原生 confirm()/alert()~~ ✅ 已修复(c9d7693:应用内确认框 askConfirm(Enter 确定/Esc 取消)+ 全局 toast,6 处原生弹窗全部替换)
 ### 19. 正则搜索语义不对称
 正则模式只搜文本条目正文([App.vue:211](../src/App.vue#L211)),图片连标签都搜不到;普通模式搜 text+tags。切换开关结果集突变。
 **改法**:正则复用相同 haystack(`text + tags`),去掉 content_type 过滤。
@@ -83,15 +72,13 @@ export 只写含绝对路径的 JSON;import 时路径存在才收、且直接引
 剪贴板工具的核心价值依赖常驻,重启后不手动打开就漏采。
 **改法**:接 tauri-plugin-autostart,设置面板加开关;主窗口本就 visible:false,自启后天然静默驻留托盘。
 
-### 23. 死依赖清理
-npm:`@vueuse/core`(0 处 import,除非按 #9 采用其虚拟列表)、`@tauri-apps/plugin-clipboard-manager`、`@tauri-apps/plugin-global-shortcut`(两插件均纯 Rust 侧使用,前端 JS 包多余);Rust:`window-vibrancy`(Mica 永久关闭后 0 调用点,[Cargo.toml:45](../src-tauri/Cargo.toml#L45))、`tokio` full features 实际只用 sleep([Cargo.toml:36](../src-tauri/Cargo.toml#L36) 改 `features=["time"]`)。
-
-### 24. 杂项修正
-- `#[cfg_attr(mobile, tauri::mobile_entry_point)]` 被 OCR 代码段隔开,错误附着在 OCR 函数上而非 `run()`([lib.rs:1446](../src-tauri/src/lib.rs#L1446));
-- lib.rs 文件头注释仍写"毛玻璃窗口"已过时(Mica 已按用户要求永久关闭);`get_has_mica` 恒返回 false,可与前端调用一并移除;
-- `filtered` computed 里写 `searchError`(副作用,[App.vue:206](../src/App.vue#L206))→ 拆独立 computed;
-- `tauri://focus` 监听未收集 unlisten([App.vue:1412](../src/App.vue#L1412)),HMR 时叠加重复处理器;
-- `items`/`imageCache` 可改 `shallowRef`,省 200 对象深代理开销。
+### 23. ~~死依赖清理~~ ✅ 已完成(c9d7693)
+npm 移除 @vueuse/core、@tauri-apps/plugin-clipboard-manager、@tauri-apps/plugin-global-shortcut;Cargo 移除 window-vibrancy,tokio 特性 full→time。
+### 24. 杂项修正 ⏳ 部分完成(c9d7693:mobile_entry_point 归位 / 文件头注释修正 / get_has_mica 已移除)
+- ~~mobile_entry_point 属性错位~~ ✅;~~文件头"毛玻璃窗口"过时注释~~ ✅;~~get_has_mica 恒 false~~ ✅ 已连同 AppState.has_mica 移除;
+- `filtered` computed 里写 `searchError`(副作用)→ 拆独立 computed;
+- `tauri://focus` 监听未收集 unlisten,HMR 时叠加重复处理器;
+- `items` 可改 `shallowRef`,省 200 对象深代理开销。
 
 ### 25. (可选)App.vue 拆分
 3789 行单文件目前尚可维护,若继续加功能建议按痛点渐进拆:先抽 OCR 弹窗(约 400 行,最独立)、设置弹窗、ClipRow 行组件(配合 #9 的 v-memo),逻辑侧抽 useClipboardList / useKeyboardNav 两个 composable。不为拆而拆。
