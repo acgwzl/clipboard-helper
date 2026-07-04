@@ -4,13 +4,11 @@
 
 ## P0 · 正确性 bug(建议最先修)
 
-### 1. 选取图片条目必然重复入库 [已人工核实]
-[lib.rs:638-639](../src-tauri/src/lib.rs#L638) `pick_item` 图片分支用 `std::fs::read` 对 **PNG 文件字节** 哈希写入 `last_hash`;而轮询([lib.rs:1818](../src-tauri/src/lib.rs#L1818))对剪贴板图片计算的是 **解码后 RGBA 像素** 的哈希——两者永不相等,且轮询对图片没有内容去重。结果:每从历史选一张图,≤500ms 后就多一条重复记录 + 一份全尺寸 PNG 文件。`paste_sequence` 末条为图片时同理(lib.rs:753-759)。
-**改法**:改为 `hash_bytes(img.rgba())`(与轮询同数据源);长期给 clips 表加 `image_hash` 列,轮询插入图片前按哈希去重。
+### 1. ~~选取图片条目必然重复入库~~ ✅ 已修复(c26050e,2026-07-04)
+pick_item 与 paste_sequence 的图片哈希已改为解码后 RGBA(与轮询同数据源)。长期项仍可选:给 clips 表加 image_hash 列做图片内容去重。
 
-### 2. 老化清理泄漏图片文件 [已人工核实]
-`prune_old`([lib.rs:271-292](../src-tauri/src/lib.rs#L271))只删 DB 行,把待删的 `image_path` 返回给调用方——但全部 6 个调用点(697 / 1032 / 1056 / 1096 / 1807 / 1828)都是 `let _ = prune_old(&conn);`,路径被丢弃,没有任何一处删文件。图片被挤出 200 条上限后 PNG 永久残留,磁盘无上界增长。
-**改法**:在 `prune_old` 内部对返回路径逐个 `fs::remove_file`(或用 `DELETE ... RETURNING image_path` 一条语句);启动时做一次孤儿文件清扫,回收已泄漏空间。
+### 2. ~~老化清理泄漏图片文件~~ ✅ 已修复(c26050e,2026-07-04)
+`prune_old` 现在删行的同时 `fs::remove_file` 删 PNG;启动时 `cleanup_orphan_images` 清扫 images 目录中无 DB 记录引用的孤儿文件,自动回收旧版本泄漏的空间。
 
 ### 3. 「全部」视图排序:拖拽排序过的收藏项永久霸占顶部 [已人工核实,刚提交 0aa2ba5 的边界情况]
 [lib.rs:234](../src-tauri/src/lib.rs#L234) `ORDER BY sort_order ASC NULLS LAST` 会把所有**有** sort_order 值的条目排在全部 NULL 条目之前;而 sort_order 只在收藏视图拖拽时写入、普通条目永远是 NULL、`toggle_pin` 取消收藏也不清除它。于是只要在收藏页拖过一次排序,这些条目就永远钉在「全部/文本/图片」顶部,与"按时间混排"的意图矛盾,还污染 Alt+1-9 序号和小窗前 5 条。
@@ -26,9 +24,8 @@
 
 ## P1 · 性能
 
-### 6. 500ms 盲轮询:内容未变也全量读图+哈希
-轮询([lib.rs:1761-1837](../src-tauri/src/lib.rs#L1761))每 tick 无条件:锁 DB 读隐私设置、查前台窗口(Win32 三连调用)、剪贴板挂着图片时整张位图拷出再 `to_vec()` 再哈希(4K 截图约 33MB,2Hz 空转)。
-**改法**:每 tick 先调 `GetClipboardSequenceNumber()`(极廉价),序列号没变直接 continue;隐私设置缓存进 AppState 而非每 tick 查库;`hash_bytes(&img.rgba().to_vec())` 去掉 `to_vec()`(1780、1818 两处)。彻底方案:message-only 窗口 + `AddClipboardFormatListener` 事件驱动。
+### 6. 500ms 盲轮询 ⏳ 部分完成(c26050e:序列号门控 + 去 to_vec)
+已加 `GetClipboardSequenceNumber()` 门控——内容未变的 tick 直接跳过(隐私查库/读图/哈希全部省掉);两处哈希去掉了多余的 `to_vec()` 拷贝。**剩余可选**:message-only 窗口 + `AddClipboardFormatListener` 彻底事件驱动(收益已大幅降低)。
 
 ### 7. 图片无缩略图 + base64 IPC + imageCache 无淘汰
 [lib.rs:596-605](../src-tauri/src/lib.rs#L596) 全尺寸 PNG → base64(膨胀 1.33×)→ IPC;前端 [App.vue:114](../src/App.vue#L114) `imageCache` 只增不减、删除条目也不清理,几十张截图 = 数百 MB 常驻内存;列表 60px 缩略图背着 4K 全图解码。
