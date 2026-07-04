@@ -7,7 +7,7 @@
 // - 系统托盘（左键切换窗口，右键菜单含最近 5 条）
 // - 自动粘贴（enigo 模拟 Ctrl+V）
 // - 收藏置顶
-// - 毛玻璃窗口（Windows mica/acrylic）
+// - 纯实色窗口(Mica/毛玻璃已按用户要求永久关闭)
 // - 拖拽入库（监听 tauri://drag-drop 后由前端调命令入库）
 // - 文本工具栏（大小写、trim、URL/Base64/MD5）
 // - 导入导出（JSON）
@@ -115,7 +115,6 @@ struct AppState {
     last_hash: Mutex<u64>,
     images_dir: PathBuf,
     current_hotkey: Mutex<Option<Shortcut>>,
-    has_mica: bool,
 }
 
 // ================== 数据库 ==================
@@ -735,8 +734,31 @@ fn pick_item(
     Ok(())
 }
 
+/// 等待物理修饰键全部松开(带超时)。用户用 Ctrl+Shift+V 唤起后快速回车时,
+/// Shift 若仍按着,发出的 Ctrl+V 会变成 Ctrl+Shift+V —— 恰好是自家全局热键,窗口会被弹回来
+#[cfg(target_os = "windows")]
+fn wait_modifiers_released(timeout_ms: u64) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    };
+    let start = std::time::Instant::now();
+    loop {
+        let pressed = unsafe {
+            [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
+                .iter()
+                .any(|&vk| (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0)
+        };
+        if !pressed || start.elapsed().as_millis() as u64 >= timeout_ms {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
 fn simulate_paste() -> Result<(), String> {
     use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+    #[cfg(target_os = "windows")]
+    wait_modifiers_released(1500);
     let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
     enigo.key(Key::Control, Direction::Press).map_err(|e| e.to_string())?;
     enigo.key(Key::Unicode('v'), Direction::Click).map_err(|e| e.to_string())?;
@@ -1031,11 +1053,6 @@ fn set_window_mode(mini: bool, app: AppHandle) -> Result<(), String> {
     }
     let _ = win.set_focus();
     Ok(())
-}
-
-#[tauri::command]
-fn get_has_mica(state: State<'_, AppState>) -> bool {
-    state.has_mica
 }
 
 #[tauri::command]
@@ -1542,7 +1559,6 @@ fn get_stats(state: State<'_, AppState>) -> Result<Stats, String> {
 
 // ================== 入口 ==================
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
 // ===================== OCR 文字识别 =====================
 #[cfg(target_os = "windows")]
 fn recognize_text_from_image_path(image_path: &str) -> Result<String, String> {
@@ -1700,6 +1716,7 @@ async fn extract_text_from_image(_image_path: String, _crop: Option<OcrCrop>) ->
     Err("OCR 仅支持 Windows 10+".to_string())
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -1723,15 +1740,12 @@ pub fn run() {
             // 读出保存过的快捷键
             let saved_hotkey = read_setting(&conn, "hotkey").unwrap_or_else(|| DEFAULT_HOTKEY.to_string());
 
-            // Mica/毛玻璃已关闭：用户要求纯实色无模糊。
-            let has_mica = false;
-
+            // Mica/毛玻璃永久关闭:用户要求纯实色无模糊
             let state = AppState {
                 db: Mutex::new(conn),
                 last_hash: Mutex::new(0),
                 images_dir: images_dir.clone(),
                 current_hotkey: Mutex::new(None),
-                has_mica,
             };
             app.manage(state);
 
@@ -1799,11 +1813,24 @@ pub fn run() {
                             }
                         }
                         "clear" => {
-                            if let Some(state) = app.try_state::<AppState>() {
-                                let _ = clear_history(state);
-                                let _ = app.emit("clips-changed", ());
-                                let _ = rebuild_tray_menu(app);
-                            }
+                            // 破坏性操作:先弹原生确认框(在独立线程,blocking_show 不能占主线程)
+                            let app = app.clone();
+                            std::thread::spawn(move || {
+                                use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+                                let confirmed = app
+                                    .dialog()
+                                    .message("确定清空所有未收藏的历史吗?\n对应图片文件会一并删除,不可恢复。")
+                                    .title("清空未收藏历史")
+                                    .kind(MessageDialogKind::Warning)
+                                    .buttons(MessageDialogButtons::OkCancelCustom("清空".to_string(), "取消".to_string()))
+                                    .blocking_show();
+                                if confirmed {
+                                    let state = app.state::<AppState>();
+                                    let _ = clear_history(state);
+                                    let _ = app.emit("clips-changed", ());
+                                    let _ = rebuild_tray_menu(&app);
+                                }
+                            });
                         }
                         "quit" => app.exit(0),
                         _ => {}
@@ -2016,7 +2043,6 @@ pub fn run() {
             hide_window,
             set_window_pin,
             set_window_mode,
-            get_has_mica,
             set_tags,
             get_privacy_status,
             set_privacy_settings,

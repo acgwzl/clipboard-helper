@@ -131,6 +131,18 @@ const sensitiveKeywordsText = ref("");
 // 拖拽调试（短暂显示在底部，帮助排查）
 const dragDebug = ref("");
 
+// 全局 toast(独立浮层,小窗模式也可见)与应用内确认框
+const toastMsg = ref("");
+let toastTimer: number | null = null;
+const confirmState = ref<{ message: string; resolve: (v: boolean) => void } | null>(null);
+function askConfirm(message: string): Promise<boolean> {
+  return new Promise((resolve) => { confirmState.value = { message, resolve }; });
+}
+function answerConfirm(v: boolean) {
+  confirmState.value?.resolve(v);
+  confirmState.value = null;
+}
+
 const hotkeyValue = ref("");
 const hotkeyEditing = ref(false);
 const hotkeyError = ref("");
@@ -537,7 +549,7 @@ async function deleteItem(item: ClipItem) {
 }
 
 async function clearAll() {
-  if (!confirm("清空所有未收藏记录？收藏项会保留。")) return;
+  if (!(await askConfirm("清空所有未收藏记录?收藏项会保留,对应图片文件将被删除。"))) return;
   await invoke("clear_history");
   await refresh();
 }
@@ -570,7 +582,7 @@ function selectNone() { selectedIds.value = new Set(); }
 async function batchDelete() {
   const ids = [...selectedIds.value];
   if (ids.length === 0) return;
-  if (!confirm(`删除选中的 ${ids.length} 条？`)) return;
+  if (!(await askConfirm(`删除选中的 ${ids.length} 条?图片文件将一并删除。`))) return;
   await invoke("batch_delete", { ids });
   selectedIds.value = new Set();
   await refresh();
@@ -653,9 +665,9 @@ async function exportAll() {
     });
     if (!path) return;
     const n = await invoke<number>("export_history", { path });
-    alert(`已导出 ${n} 条到\n${path}`);
+    showToast(`已导出 ${n} 条`);
   } catch (e: any) {
-    alert("导出失败: " + e);
+    showToast("导出失败: " + e);
   }
 }
 async function importAll() {
@@ -666,10 +678,10 @@ async function importAll() {
     });
     if (!path || typeof path !== "string") return;
     const n = await invoke<number>("import_history", { path });
-    alert(`已导入 ${n} 条`);
+    showToast(`已导入 ${n} 条`);
     await refresh();
   } catch (e: any) {
-    alert("导入失败: " + e);
+    showToast("导入失败: " + e);
   }
 }
 
@@ -890,8 +902,9 @@ async function copyDomain(item: ClipItem) {
 }
 
 function showToast(message: string) {
-  dragDebug.value = message;
-  setTimeout(() => { if (dragDebug.value === message) dragDebug.value = ""; }, 1800);
+  toastMsg.value = message;
+  if (toastTimer != null) clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => { toastMsg.value = ""; toastTimer = null; }, 1800);
 }
 
 /* ===================== Track 3 内容智能 ===================== */
@@ -1231,8 +1244,7 @@ async function setupDragDrop() {
         fail++;
       }
     }
-    dragDebug.value = `已加入 ${ok} 条${fail > 0 ? `，失败 ${fail}` : ""}`;
-    setTimeout(() => { dragDebug.value = ""; }, 2500);
+    showToast(`已加入 ${ok} 条${fail > 0 ? `，失败 ${fail}` : ""}`);
     await refresh();
   };
 
@@ -1279,6 +1291,11 @@ function onKeydown(e: KeyboardEvent) {
     e.preventDefault();
     searchInput.value?.focus();
     searchInput.value?.select();
+    return;
+  }
+  if (confirmState.value) {
+    if (e.key === "Escape") answerConfirm(false);
+    else if (e.key === "Enter") { e.preventDefault(); answerConfirm(true); }
     return;
   }
   if (helpOpen.value) {
@@ -2321,6 +2338,20 @@ listen("tauri://focus", () => {
         <div class="drag-text">松开以加入剪贴板</div>
       </div>
     </div>
+
+    <!-- 应用内确认框 -->
+    <div v-if="confirmState" class="modal-bg" @click="answerConfirm(false)">
+      <div class="confirm-panel" @click.stop>
+        <div class="confirm-msg">{{ confirmState.message }}</div>
+        <div class="confirm-actions">
+          <button class="setting-btn" @click="answerConfirm(false)">取消</button>
+          <button class="setting-btn primary" @click="answerConfirm(true)">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 全局 toast -->
+    <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
 
     <div class="resize-hint" aria-hidden="true"></div>
   </div>
@@ -3691,4 +3722,22 @@ h1 {
 
 /* 小节标题衬线化 */
 .eyebrow { font-family: var(--font-display); font-weight: 700; }
+
+/* ===== 应用内确认框 + 全局 toast ===== */
+.confirm-panel {
+  width: min(360px, 86vw);
+  background: var(--panel); border: var(--bw) solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow-lg);
+  padding: 16px;
+}
+.confirm-msg { font-size: 13px; line-height: 1.6; color: var(--text); white-space: pre-line; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.toast {
+  position: fixed; left: 50%; bottom: 46px; transform: translateX(-50%);
+  z-index: 300; pointer-events: none;
+  background: var(--text); color: var(--panel);
+  padding: 7px 14px; border-radius: var(--radius-sm);
+  font-size: 12px; box-shadow: var(--shadow);
+}
+.mini-mode .toast { bottom: 10px; }
 </style>
