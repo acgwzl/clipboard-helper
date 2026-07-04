@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
+import { ref, shallowRef, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -66,7 +66,7 @@ const THEMES: { id: Theme; name: string; color: string; kind: "light" | "dark" }
 ];
 
 // ----- state -----
-const items = ref<ClipItem[]>([]);
+const items = shallowRef<ClipItem[]>([]); // 只做整表替换,浅响应即可,省 200 对象深代理
 const search = ref("");
 const selectedIndex = ref(0);
 const filter = ref<Filter>("all");
@@ -92,7 +92,12 @@ const ocrZoom = ref(1);
 const ocrBaseScale = ref(1);
 const ocrNaturalSize = ref({ width: 0, height: 0 });
 const advancedOpen = ref(localStorage.getItem("advancedOpen") === "true");
-const searchError = ref("");
+// 正则错误独立派生,避免在 filtered computed 里写副作用
+const searchError = computed(() => {
+  const q = search.value.trim();
+  if (!q || !regexMode.value) return "";
+  try { new RegExp(q); return ""; } catch (e: any) { return e?.message || "正则无效"; }
+});
 const VALID_THEMES: Theme[] = ["archive", "archive-dark"];
 const storedTheme = localStorage.getItem("theme") as Theme | null;
 const theme = ref<Theme>(storedTheme && VALID_THEMES.includes(storedTheme) ? storedTheme : "archive");
@@ -217,14 +222,13 @@ const filtered = computed(() => {
   if (autoTagFilter.value) list = list.filter((i) => autoTags(i).includes(autoTagFilter.value));
 
   const q = search.value.trim();
-  searchError.value = "";
   if (q) {
     if (regexMode.value) {
       try {
         const re = new RegExp(q, caseSensitive.value ? "" : "i");
-        list = list.filter((i) => i.content_type === "text" && !!i.text && re.test(i.text));
-      } catch (e: any) {
-        searchError.value = e?.message || "正则无效";
+        // 与普通搜索同一 haystack(正文+标签),图片条目也能按标签搜到
+        list = list.filter((i) => re.test([i.text || "", ...(i.tags || [])].join(" ")));
+      } catch {
         list = [];
       }
     } else {
@@ -389,7 +393,8 @@ function timeMatches(ts: number, value: TimeFilter): boolean {
   return true;
 }
 
-function searchRegex(): RegExp | null {
+// 编译后的搜索正则缓存为 computed,避免每行渲染各重编译一次
+const searchRegexC = computed<RegExp | null>(() => {
   const q = search.value.trim();
   if (!q) return null;
   try {
@@ -398,6 +403,9 @@ function searchRegex(): RegExp | null {
   } catch {
     return null;
   }
+});
+function searchRegex(): RegExp | null {
+  return searchRegexC.value;
 }
 
 function escapeRegExp(text: string): string {
@@ -601,9 +609,15 @@ function orderedSelectedIds(): number[] {
 }
 
 // 前 9 条的 1-based 序号，用于 Alt+数字 快速粘贴的角标
+// Alt+1-9 序号查表(O(n) 一次构建),替代每行 findIndex 的 O(n²)
+const quickNoMap = computed(() => {
+  const m = new Map<number, number>();
+  const list = flatIndexed.value;
+  for (let i = 0; i < list.length && i < 9; i++) m.set(list[i].id, i + 1);
+  return m;
+});
 function quickIndex(item: ClipItem): number | null {
-  const i = flatIndexed.value.findIndex((x) => x.id === item.id);
-  return i >= 0 && i < 9 ? i + 1 : null;
+  return quickNoMap.value.get(item.id) ?? null;
 }
 
 // 占位符检测与替换
@@ -806,10 +820,17 @@ function urlInfo(text: string | null | undefined): { url: string; host: string; 
   }
 }
 
+const jsonCheckCache = new Map<string, boolean>();
 function looksJson(text: string | null | undefined): boolean {
   const t = (text || "").trim();
   if (!/^[\[{]/.test(t)) return false;
-  try { JSON.parse(t); return true; } catch { return false; }
+  const hit = jsonCheckCache.get(t);
+  if (hit !== undefined) return hit;
+  let ok = false;
+  try { JSON.parse(t); ok = true; } catch { ok = false; }
+  if (jsonCheckCache.size > 300) jsonCheckCache.clear();
+  jsonCheckCache.set(t, ok);
+  return ok;
 }
 
 function jsonSummary(text: string | null | undefined): string {
@@ -1453,7 +1474,7 @@ onUnmounted(() => {
   document.removeEventListener("visibilitychange", onVisibilityChange);
 });
 
-listen("tauri://focus", () => {
+void listen("tauri://focus", () => {
   searchInput.value?.focus();
   search.value = "";
   selectedIndex.value = 0;
@@ -1462,7 +1483,7 @@ listen("tauri://focus", () => {
     refreshDirty = false;
     void refresh();
   }
-});
+}).then((u) => unlistenFns.push(u));
 </script>
 
 <template>
@@ -1696,6 +1717,7 @@ listen("tauri://focus", () => {
         <div
           v-for="item in (miniMode ? miniItems : filtered)"
           :key="item.id"
+          v-memo="[item, isSelected(item), selectedIds.has(item.id), draggedItemId === item.id, dropTargetId === item.id, selectMode, miniMode, filter, theme, search, selectedTag, autoTagFilter, now]"
           :class="['item', { selected: isSelected(item), pinned: item.pinned, 'multi-on': selectedIds.has(item.id), 'dragging': draggedItemId === item.id, 'drop-target': dropTargetId === item.id }]"
           :draggable="filter === 'pinned' && item.pinned && !selectMode"
           @click="pickItem(item)"
@@ -1831,6 +1853,7 @@ listen("tauri://focus", () => {
           <div
             v-for="item in g.items"
             :key="item.id"
+            v-memo="[item, isSelected(item), selectedIds.has(item.id), selectMode, theme, search, selectedTag, autoTagFilter, now]"
             :class="['item', { selected: isSelected(item), pinned: item.pinned, 'multi-on': selectedIds.has(item.id) }]"
             @click="pickItem(item)"
           >

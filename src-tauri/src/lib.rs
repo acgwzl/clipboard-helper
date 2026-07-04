@@ -373,6 +373,12 @@ fn hash_bytes(data: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// 锁中毒(某持锁线程 panic)时取回内部数据继续运行,
+/// 轮询与托盘等常驻路径不因一次 panic 永久停摆
+fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn toggle_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         if win.is_visible().unwrap_or(false) {
@@ -615,7 +621,7 @@ fn parse_shortcut(combo: &str) -> Result<Shortcut, String> {
 fn rebuild_tray_menu(app: &AppHandle) -> tauri::Result<()> {
     let recent = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        let conn = lock_ok(&state.db);
         query_recent(&conn, 5).unwrap_or_default()
     };
 
@@ -1898,7 +1904,7 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(move || {
                 let state = backfill_handle.state::<AppState>();
                 let todo: Vec<(i64, String)> = {
-                    let conn = state.db.lock().unwrap();
+                    let conn = lock_ok(&state.db);
                     let mut stmt = match conn.prepare(
                         "SELECT id, image_path FROM clips \
                          WHERE content_type = 'image' AND image_path IS NOT NULL AND thumb_path IS NULL",
@@ -1917,7 +1923,7 @@ pub fn run() {
                 for (id, path) in todo {
                     // 编码在锁外进行,只有写回时短暂持锁
                     if let Some(tp) = make_thumbnail(&path) {
-                        let conn = state.db.lock().unwrap();
+                        let conn = lock_ok(&state.db);
                         let _ = conn.execute(
                             "UPDATE clips SET thumb_path = ?1 WHERE id = ?2",
                             params![tp, id],
@@ -1955,18 +1961,18 @@ pub fn run() {
                     let state = poll_handle.state::<AppState>();
 
                     let privacy = {
-                        let conn = state.db.lock().unwrap();
+                        let conn = lock_ok(&state.db);
                         read_privacy_settings(&conn)
                     };
                     if privacy_block_reason(&privacy).is_some() {
                         if let Ok(text) = clipboard.read_text() {
                             if !text.is_empty() {
-                                *state.last_hash.lock().unwrap() = hash_bytes(text.as_bytes());
+                                *lock_ok(&state.last_hash) = hash_bytes(text.as_bytes());
                                 continue;
                             }
                         }
                         if let Ok(img) = clipboard.read_image() {
-                            *state.last_hash.lock().unwrap() = hash_bytes(img.rgba());
+                            *lock_ok(&state.last_hash) = hash_bytes(img.rgba());
                         }
                         continue;
                     }
@@ -1974,30 +1980,33 @@ pub fn run() {
                     if let Ok(text) = clipboard.read_text() {
                         if !text.is_empty() {
                             let h = hash_bytes(text.as_bytes());
-                            let mut last = state.last_hash.lock().unwrap();
-                            if *last != h {
-                                *last = h;
-                                drop(last);
-                                let conn = state.db.lock().unwrap();
-                                let existing: Option<i64> = conn
-                                    .query_row(
-                                        "SELECT id FROM clips WHERE content_type='text' AND text = ?1",
-                                        params![text],
-                                        |r| r.get(0),
-                                    )
-                                    .ok();
-                                if let Some(id) = existing {
-                                    let _ = conn.execute(
-                                        "UPDATE clips SET created_at = ?1 WHERE id = ?2",
-                                        params![Utc::now().timestamp_millis(), id],
-                                    );
-                                } else {
-                                    let _ = insert_text(&conn, &text);
-                                    let _ = prune_old(&conn);
+                            if *lock_ok(&state.last_hash) != h {
+                                // 先落库、成功后才更新 last_hash:写入失败的内容不会被无声吞掉
+                                let ok = {
+                                    let conn = lock_ok(&state.db);
+                                    let existing: Option<i64> = conn
+                                        .query_row(
+                                            "SELECT id FROM clips WHERE content_type='text' AND text = ?1",
+                                            params![text],
+                                            |r| r.get(0),
+                                        )
+                                        .ok();
+                                    if let Some(id) = existing {
+                                        conn.execute(
+                                            "UPDATE clips SET created_at = ?1 WHERE id = ?2",
+                                            params![Utc::now().timestamp_millis(), id],
+                                        )
+                                        .is_ok()
+                                    } else {
+                                        let inserted = insert_text(&conn, &text).is_ok();
+                                        let _ = prune_old(&conn);
+                                        inserted
+                                    }
+                                };
+                                if ok {
+                                    *lock_ok(&state.last_hash) = h;
+                                    let _ = poll_handle.emit("clips-changed", ());
                                 }
-                                drop(conn);
-                                let _ = poll_handle.emit("clips-changed", ());
-                                continue;
                             }
                             continue;
                         }
@@ -2005,17 +2014,19 @@ pub fn run() {
 
                     if let Ok(img) = clipboard.read_image() {
                         let h = hash_bytes(img.rgba());
-                        let mut last = state.last_hash.lock().unwrap();
-                        if *last != h {
-                            *last = h;
-                            drop(last);
+                        if *lock_ok(&state.last_hash) != h {
                             match save_clipboard_image(&img, &state.images_dir) {
                                 Ok((path, thumb, width, height, bytes)) => {
-                                    let conn = state.db.lock().unwrap();
-                                    let _ = insert_image(&conn, &path, thumb.as_deref(), width, height, bytes);
-                                    let _ = prune_old(&conn);
-                                    drop(conn);
-                                    let _ = poll_handle.emit("clips-changed", ());
+                                    let inserted = {
+                                        let conn = lock_ok(&state.db);
+                                        let r = insert_image(&conn, &path, thumb.as_deref(), width, height, bytes).is_ok();
+                                        let _ = prune_old(&conn);
+                                        r
+                                    };
+                                    if inserted {
+                                        *lock_ok(&state.last_hash) = h;
+                                        let _ = poll_handle.emit("clips-changed", ());
+                                    }
                                 }
                                 Err(e) => eprintln!("save image failed: {}", e),
                             }
