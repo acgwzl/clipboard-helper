@@ -31,7 +31,7 @@ interface Stats {
 }
 
 type Filter = "all" | "text" | "image" | "pinned";
-type Theme = "light" | "biophilic" | "fabric" | "editorial" | "mono" | "softui" | "swiss" | "mono-dark" | "graphite" | "cobalt" | "dusk" | "midnight";
+type Theme = "archive" | "archive-dark";
 type Group = "今天" | "昨天" | "本周" | "本月" | "更早";
 type TimeFilter = "any" | "today" | "yesterday" | "week" | "month" | "older";
 
@@ -59,18 +59,8 @@ interface OcrCrop {
 }
 
 const THEMES: { id: Theme; name: string; color: string; kind: "light" | "dark" }[] = [
-  { id: "light", name: "浅",   color: "#0c8a55", kind: "light" },
-  { id: "biophilic", name: "生机", color: "#2f6f4e", kind: "light" },
-  { id: "fabric",    name: "织物", color: "#2d6372", kind: "light" },
-  { id: "editorial", name: "刊物", color: "#ef3a23", kind: "light" },
-  { id: "mono",      name: "单色", color: "#141414", kind: "light" },
-  { id: "softui",    name: "软质", color: "#267c68", kind: "light" },
-  { id: "swiss",     name: "瑞士", color: "#e53935", kind: "light" },
-  { id: "mono-dark", name: "单色·夜", color: "#f0f0f0", kind: "dark" },
-  { id: "graphite",  name: "石墨", color: "#a7b0bd", kind: "dark" },
-  { id: "cobalt",    name: "钴蓝", color: "#7fa7ff", kind: "dark" },
-  { id: "dusk",      name: "暮紫", color: "#b6a4ff", kind: "dark" },
-  { id: "midnight",  name: "午夜", color: "#8fb4ff", kind: "dark" },
+  { id: "archive",      name: "档案",   color: "#c14a2e", kind: "light" },
+  { id: "archive-dark", name: "档案·夜", color: "#e06a4a", kind: "dark" },
 ];
 
 // ----- state -----
@@ -101,9 +91,9 @@ const ocrBaseScale = ref(1);
 const ocrNaturalSize = ref({ width: 0, height: 0 });
 const advancedOpen = ref(localStorage.getItem("advancedOpen") === "true");
 const searchError = ref("");
-const VALID_THEMES: Theme[] = ["light", "biophilic", "fabric", "editorial", "mono", "softui", "swiss", "mono-dark", "graphite", "cobalt", "dusk", "midnight"];
+const VALID_THEMES: Theme[] = ["archive", "archive-dark"];
 const storedTheme = localStorage.getItem("theme") as Theme | null;
-const theme = ref<Theme>(storedTheme && VALID_THEMES.includes(storedTheme) ? storedTheme : "graphite");
+const theme = ref<Theme>(storedTheme && VALID_THEMES.includes(storedTheme) ? storedTheme : "archive");
 const pinned = ref<boolean>(localStorage.getItem("pinned") === "true");
 const themePickerOpen = ref(false);
 const menuOpen = ref(false);
@@ -112,6 +102,9 @@ const dropTargetId = ref<number | null>(null);
 const lightboxItem = ref<ClipItem | null>(null);
 const searchInput = ref<HTMLInputElement | null>(null);
 const imageCache = ref<Record<string, string>>({});
+const IMAGE_CACHE_LIMIT = 48;
+const IMAGE_PRELOAD_LIMIT = 32;
+const imageLoadInFlight = new Set<string>();
 let unlistenFns: UnlistenFn[] = [];
 const now = ref(Date.now());
 
@@ -325,21 +318,64 @@ function isSelected(item: ClipItem): boolean {
   return flatIndexed.value[selectedIndex.value]?.id === item.id;
 }
 
+function cachedImageKeepSet(limit = IMAGE_CACHE_LIMIT): Set<string> {
+  const keep = new Set<string>();
+  if (lightboxItem.value?.image_path) keep.add(lightboxItem.value.image_path);
+  if (ocrItem.value?.image_path) keep.add(ocrItem.value.image_path);
+
+  const selected = flatIndexed.value[selectedIndex.value];
+  if (selected?.image_path) keep.add(selected.image_path);
+
+  const prefetchLimit = miniMode.value ? 8 : limit;
+  for (const item of flatIndexed.value) {
+    if (item.image_path) keep.add(item.image_path);
+    if (keep.size >= prefetchLimit) break;
+  }
+  return keep;
+}
+
+function pruneImageCache(extraKeep: string[] = []) {
+  const keep = cachedImageKeepSet();
+  for (const path of extraKeep) keep.add(path);
+  const next: Record<string, string> = {};
+  for (const path of keep) {
+    if (imageCache.value[path]) next[path] = imageCache.value[path];
+  }
+  imageCache.value = next;
+}
+
+async function ensureImagePathCached(path: string) {
+  if (imageCache.value[path] || imageLoadInFlight.has(path)) return;
+  imageLoadInFlight.add(path);
+  try {
+    const dataUrl = await invoke<string>("read_image_as_data_url", { path });
+    imageCache.value = { ...imageCache.value, [path]: dataUrl };
+    pruneImageCache([path]);
+  } finally {
+    imageLoadInFlight.delete(path);
+  }
+}
+
+async function warmVisibleImageCache() {
+  pruneImageCache();
+  const keep = cachedImageKeepSet(IMAGE_PRELOAD_LIMIT);
+  for (const path of keep) {
+    try {
+      await ensureImagePathCached(path);
+    } catch { /* ignore */ }
+  }
+}
+
+watch([flatIndexed, miniMode, selectedIndex, lightboxItem, ocrItem], () => {
+  void warmVisibleImageCache();
+}, { flush: "post" });
+
 async function refresh() {
   items.value = await invoke<ClipItem[]>("get_items");
   if (selectedIndex.value >= flatIndexed.value.length) {
     selectedIndex.value = Math.max(0, flatIndexed.value.length - 1);
   }
-  for (const item of items.value) {
-    if (item.image_path && !imageCache.value[item.image_path]) {
-      try {
-        imageCache.value[item.image_path] = await invoke<string>(
-          "read_image_as_data_url",
-          { path: item.image_path }
-        );
-      } catch (e) { /* ignore */ }
-    }
-  }
+  await warmVisibleImageCache();
 }
 
 function timeMatches(ts: number, value: TimeFilter): boolean {
@@ -729,13 +765,22 @@ async function openStats() {
 }
 
 // ----- 三栏布局辅助 -----
-function typeGlyph(item: ClipItem): string {
+// ---- 档案主题结构元素 ----
+const brandSub = computed(() => `ARCHIVE NO. ${String(items.value[0]?.id ?? 0).padStart(4, "0")}`);
+
+function serialOf(item: ClipItem): string {
+  return String(item.id % 10000).padStart(4, "0");
+}
+
+// 条目"类型章":档案语言的汉字铅字(收藏=藏)
+function themedGlyph(item: ClipItem): string {
+  if (item.pinned) return "藏";
   if (item.content_type === "image") return "图";
-  const t = (item.text || "").trim();
-  if (/^[\[{]/.test(t)) return "{}";
-  if (/^https?:\/\//i.test(t)) return "链";
-  if (/^(npm|yarn|pnpm|git|cargo|cd|sudo|docker|node|python|pip|curl)\b/.test(t)) return ">_";
-  if (/^([a-zA-Z]:\\|\/|\.\/|~\/)/.test(t)) return "/";
+  if (detectUrl(item.text)) return "链";
+  if (detectEmail(item.text)) return "邮";
+  if (detectColor(item.text)) return "色";
+  if (looksJson(item.text)) return "码";
+  if (detectPath(item.text)) return "档";
   return "文";
 }
 
@@ -922,12 +967,13 @@ async function openQr(item: ClipItem) {
   }
 }
 
-async function ensureImageCached(item: ClipItem) {
+async function ensureImageCached(item: ClipItem, silent = false) {
   if (!item.image_path || imageCache.value[item.image_path]) return;
-  imageCache.value[item.image_path] = await invoke<string>(
-    "read_image_as_data_url",
-    { path: item.image_path }
-  );
+  try {
+    await ensureImagePathCached(item.image_path);
+  } catch (e) {
+    if (!silent) throw e;
+  }
 }
 
 // OCR 文字识别：先弹窗确认，用户确认后再加入列表
@@ -1446,7 +1492,7 @@ listen("tauri://focus", () => {
         <span class="mark" aria-hidden="true"><svg class="ic"><use href="#i-term"/></svg></span>
         <div class="brand-text">
           <h1>剪贴板助手</h1>
-          <span class="sub">command mode</span>
+          <span class="sub">{{ brandSub }}</span>
         </div>
       </div>
 
@@ -1650,6 +1696,7 @@ listen("tauri://focus", () => {
           :class="['item', { selected: isSelected(item), pinned: item.pinned, 'multi-on': selectedIds.has(item.id), 'dragging': draggedItemId === item.id, 'drop-target': dropTargetId === item.id }]"
           :draggable="filter === 'pinned' && item.pinned && !selectMode"
           @click="pickItem(item)"
+          @mouseenter="ensureImageCached(item, true)"
           @dragstart="onDragStart(item, $event)"
           @dragover="onDragOver(item, $event)"
           @dragleave="onDragLeave"
@@ -1657,7 +1704,7 @@ listen("tauri://focus", () => {
           @dragend="onDragEnd"
         >
           <span v-if="!miniMode && !selectMode && quickIndex(item)" class="quick-no" :title="`Alt+${quickIndex(item)} 快速粘贴`">{{ quickIndex(item) }}</span>
-          <span class="glyph" aria-hidden="true">{{ typeGlyph(item) }}</span>
+          <span class="serial" aria-hidden="true">{{ serialOf(item) }}</span><span class="glyph" aria-hidden="true">{{ themedGlyph(item) }}</span>
           <div class="item-main">
             <div class="item-title">
               <span>{{ typeLabel(item) }}</span>
@@ -1675,6 +1722,8 @@ listen("tauri://focus", () => {
                 v-if="item.image_path && imageCache[item.image_path]"
                 :src="imageCache[item.image_path]"
                 class="thumb" alt=""
+                loading="lazy"
+                decoding="async"
                 @click.stop="openLightbox(item)"
                 title="点击查看大图"
               />
@@ -1782,9 +1831,10 @@ listen("tauri://focus", () => {
             :key="item.id"
             :class="['item', { selected: isSelected(item), pinned: item.pinned, 'multi-on': selectedIds.has(item.id) }]"
             @click="pickItem(item)"
+            @mouseenter="ensureImageCached(item, true)"
           >
             <span v-if="!selectMode && quickIndex(item)" class="quick-no" :title="`Alt+${quickIndex(item)} 快速粘贴`">{{ quickIndex(item) }}</span>
-            <span class="glyph" aria-hidden="true">{{ typeGlyph(item) }}</span>
+            <span class="serial" aria-hidden="true">{{ serialOf(item) }}</span><span class="glyph" aria-hidden="true">{{ themedGlyph(item) }}</span>
             <div class="item-main">
               <div class="item-title">
                 <span>{{ typeLabel(item) }}</span>
@@ -1802,6 +1852,8 @@ listen("tauri://focus", () => {
                   v-if="item.image_path && imageCache[item.image_path]"
                   :src="imageCache[item.image_path]"
                   class="thumb" alt=""
+                  loading="lazy"
+                  decoding="async"
                   @click.stop="openLightbox(item)"
                   title="点击查看大图"
                 />
@@ -2298,236 +2350,59 @@ listen("tauri://focus", () => {
   --bw: 1px;
   --transition: .22s cubic-bezier(.4,0,.2,1);
   --field: var(--panel-soft);
+  --font-ui:
+    "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI",
+    "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB",
+    system-ui, sans-serif;
+  --font-mono: "Courier Prime", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --font-display: "Zilla Slab", "Noto Serif SC", "Microsoft YaHei", serif;
 }
-:root,
-[data-theme="light"] {
-  --bg: #f7f8f5;
-  --panel: #ffffff;
-  --panel-soft: #eef0ec;
-  --panel-2: #ffffff;
-  --text: #14181a;
-  --text-secondary: #586068;
-  --text-tertiary: #8a9099;
-  --border: rgba(16,22,20,.10);
-  --border-strong: rgba(16,22,20,.18);
-  --accent: #0c8a55;
-  --accent-hover: #0a7449;
-  --accent-ink: #ffffff;
-  --accent-soft: rgba(12,138,85,.12);
-  --shadow-sm: 0 1px 2px rgba(40,50,45,.05);
-  --shadow:    0 4px 12px rgba(40,50,45,.09);
-  --shadow-lg: 0 14px 34px rgba(40,50,45,.16);
+/* ===== 基底 = 档案 archive(prototypes/d):牛皮纸 + 墨蓝/朱砂双色油墨 ===== */
+:root {
+  --bg: #e9dfc8;
+  --panel: #f8f2e3;
+  --panel-soft: #efe7d2;
+  --panel-2: #f4edda;
+  --text: #2c4460;
+  --text-secondary: #5c7186;
+  --text-tertiary: #8fa0b0;
+  --border: rgba(44,68,96,.30);
+  --border-strong: rgba(44,68,96,.55);
+  --accent: #c14a2e;
+  --accent-hover: #9c3520;
+  --accent-ink: #f8f2e3;
+  --accent-soft: rgba(193,74,46,.13);
+  --shadow-sm: 0 2px 0 rgba(44,68,96,.10);
+  --shadow:    0 4px 0 rgba(44,68,96,.14);
+  --shadow-lg: 0 4px 0 rgba(44,68,96,.18), 10px 12px 0 rgba(44,68,96,.10);
+  --shadow-sel: 2px 3px 0 rgba(44,68,96,.22);
+  --radius: 5px; --radius-sm: 3px;
+  --ruling: rgba(44,68,96,.05);   /* 卡纸横线 */
+  --grain: rgba(44,68,96,.03);    /* 桌面斜纹 */
+  --punch: rgba(44,68,96,.35);    /* 打孔描边 */
 }
-/* ===== 原型皮肤主题（同布局，纯实色无模糊；字体统一 IBM Plex） ===== */
-[data-theme="biophilic"] {
-  --bg: #eef3ea;
-  --panel: #fffaf0;
-  --panel-soft: #e9efe4;
-  --panel-2: #f7f8ef;
-  --text: #1d2c24;
-  --text-secondary: #51625a;
-  --text-tertiary: #84938a;
-  --border: rgba(51,82,62,.18);
-  --border-strong: rgba(51,82,62,.32);
-  --accent: #2f6f4e;
-  --accent-hover: #255b40;
-  --accent-ink: #ffffff;
-  --accent-soft: rgba(47,111,78,.13);
-  --shadow-sm: 0 1px 2px rgba(37,61,44,.07);
-  --shadow:    0 9px 22px rgba(37,61,44,.12);
-  --shadow-lg: 0 18px 44px rgba(37,61,44,.17);
-  --radius: 9px; --radius-sm: 6px;
-}
-[data-theme="fabric"] {
-  --bg: #efe9dd;
-  --panel: #fffaf1;
-  --panel-soft: #e9e2d4;
-  --panel-2: #f7f1e7;
-  --text: #27323a;
-  --text-secondary: #5c6365;
-  --text-tertiary: #8a8c86;
-  --border: rgba(80,68,52,.20);
-  --border-strong: rgba(80,68,52,.34);
-  --accent: #2d6372;
-  --accent-hover: #214d59;
-  --accent-ink: #ffffff;
-  --accent-soft: rgba(45,99,114,.14);
-  --shadow-sm: 0 1px 2px rgba(72,58,42,.08);
-  --shadow:    0 8px 20px rgba(72,58,42,.13);
-  --shadow-lg: 0 18px 42px rgba(72,58,42,.18);
-  --radius: 8px; --radius-sm: 6px;
-}
-[data-theme="editorial"] {
-  --bg: #f4f1ea;
-  --panel: #faf8f2;
-  --panel-soft: #ece8de;
-  --panel-2: #efeae0;
-  --text: #15140f;
-  --text-secondary: #3c3a31;
-  --text-tertiary: #6c685c;
-  --border: #201e17;
-  --border-strong: #15140f;
-  --accent: #ef3a23;
-  --accent-hover: #cf2d18;
-  --accent-ink: #ffffff;
-  --accent-soft: rgba(239,58,35,.13);
-  --shadow-sm: 0 2px 0 rgba(21,20,15,.10);
-  --shadow:    0 10px 24px rgba(21,20,15,.12);
-  --shadow-lg: 0 18px 40px rgba(21,20,15,.18);
-  --radius: 0px; --radius-sm: 2px;
-  --bw: 2px;
-}
-[data-theme="mono"] {
-  --bg: #f4f4f4;
-  --panel: #ffffff;
-  --panel-soft: #efefef;
-  --panel-2: #ffffff;
-  --text: #111111;
-  --text-secondary: #5c5c5c;
-  --text-tertiary: #949494;
-  --border: #e2e2e2;
-  --border-strong: #c7c7c7;
-  --accent: #141414;
-  --accent-hover: #000000;
-  --accent-ink: #ffffff;
-  --accent-soft: #e8e8e8;
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.06);
-  --shadow:    0 9px 24px rgba(0,0,0,.10);
-  --shadow-lg: 0 18px 46px rgba(0,0,0,.13);
-  --radius: 6px; --radius-sm: 4px;
-}
-[data-theme="softui"] {
-  --bg: #eef1f4;
-  --panel: #eef1f4;
-  --panel-soft: #e4e8ec;
-  --panel-2: #f1f4f7;
-  --text: #26313d;
-  --text-secondary: #5c6776;
-  --text-tertiary: #8b96a3;
-  --border: rgba(89,104,118,.16);
-  --border-strong: rgba(89,104,118,.26);
-  --accent: #267c68;
-  --accent-hover: #1e6655;
-  --accent-ink: #ffffff;
-  --accent-soft: rgba(38,124,104,.13);
-  --shadow-sm: 5px 5px 12px rgba(146,158,170,.30), -5px -5px 12px rgba(255,255,255,.80);
-  --shadow:    8px 8px 18px rgba(146,158,170,.34), -8px -8px 18px rgba(255,255,255,.85);
-  --shadow-lg: 12px 12px 28px rgba(146,158,170,.38), -12px -12px 28px rgba(255,255,255,.90);
-  --radius: 12px; --radius-sm: 8px;
-}
-[data-theme="swiss"] {
-  --bg: #f8f7f2;
-  --panel: #ffffff;
-  --panel-soft: #f0efe8;
-  --panel-2: #ffffff;
-  --text: #111111;
-  --text-secondary: #5c5c58;
-  --text-tertiary: #8c8a82;
-  --border: #111111;
-  --border-strong: #111111;
-  --accent: #e53935;
-  --accent-hover: #c62b28;
-  --accent-ink: #ffffff;
-  --accent-soft: rgba(229,57,53,.12);
-  --shadow-sm: 3px 3px 0 #111111;
-  --shadow:    5px 5px 0 #111111;
-  --shadow-lg: 8px 8px 0 #111111;
-  --radius: 0px; --radius-sm: 0px;
-}
-[data-theme="mono-dark"] {
-  --bg: #0f0f0f;
-  --panel: #181818;
-  --panel-soft: #1f1f1f;
-  --panel-2: #181818;
-  --text: #f2f2f2;
-  --text-secondary: #a8a8a8;
-  --text-tertiary: #6e6e6e;
-  --border: #2c2c2c;
-  --border-strong: #444444;
-  --accent: #f0f0f0;
-  --accent-hover: #ffffff;
-  --accent-ink: #111111;
-  --accent-soft: rgba(240,240,240,.12);
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.50);
-  --shadow:    0 9px 24px rgba(0,0,0,.55);
-  --shadow-lg: 0 18px 46px rgba(0,0,0,.62);
-  --radius: 6px; --radius-sm: 4px;
-}
-[data-theme="graphite"] {
-  --bg: #101216;
-  --panel: #171a20;
-  --panel-soft: #20242c;
-  --panel-2: #14171d;
-  --text: #edf0f5;
-  --text-secondary: #b0b7c3;
-  --text-tertiary: #747d8c;
-  --border: rgba(213,221,234,.10);
-  --border-strong: rgba(213,221,234,.22);
-  --accent: #a7b0bd;
-  --accent-hover: #c0c7d1;
-  --accent-ink: #0e1116;
-  --accent-soft: rgba(167,176,189,.16);
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.46);
-  --shadow:    0 8px 24px rgba(0,0,0,.54);
-  --shadow-lg: 0 18px 46px rgba(0,0,0,.64);
-  --radius: 6px; --radius-sm: 4px;
-}
-[data-theme="cobalt"] {
-  --bg: #0d111b;
-  --panel: #131a29;
-  --panel-soft: #1b2437;
-  --panel-2: #101625;
-  --text: #edf3ff;
-  --text-secondary: #acb8d0;
-  --text-tertiary: #707d99;
-  --border: rgba(196,213,255,.10);
-  --border-strong: rgba(196,213,255,.23);
-  --accent: #7fa7ff;
-  --accent-hover: #9abaff;
-  --accent-ink: #071022;
-  --accent-soft: rgba(127,167,255,.16);
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.46);
-  --shadow:    0 8px 24px rgba(0,0,0,.54);
-  --shadow-lg: 0 18px 46px rgba(0,0,0,.64);
-  --radius: 6px; --radius-sm: 4px;
-}
-[data-theme="dusk"] {
-  --bg: #100f18;
-  --panel: #181625;
-  --panel-soft: #211f31;
-  --panel-2: #141320;
-  --text: #f2efff;
-  --text-secondary: #b9b0cf;
-  --text-tertiary: #776f91;
-  --border: rgba(218,207,255,.10);
-  --border-strong: rgba(218,207,255,.22);
-  --accent: #b6a4ff;
-  --accent-hover: #c8bbff;
-  --accent-ink: #100d20;
-  --accent-soft: rgba(182,164,255,.16);
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.46);
-  --shadow:    0 8px 24px rgba(0,0,0,.54);
-  --shadow-lg: 0 18px 46px rgba(0,0,0,.64);
-  --radius: 7px; --radius-sm: 4px;
-}
-[data-theme="midnight"] {
-  --bg: #0c1018;
-  --panel: #121827;
-  --panel-soft: #1a2233;
-  --panel-2: #0f1420;
-  --text: #edf2ff;
-  --text-secondary: #aebbd4;
-  --text-tertiary: #6e7c99;
-  --border: rgba(198,214,255,.10);
-  --border-strong: rgba(198,214,255,.22);
-  --accent: #8fb4ff;
-  --accent-hover: #a6c4ff;
-  --accent-ink: #071022;
-  --accent-soft: rgba(143,180,255,.16);
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.46);
-  --shadow:    0 8px 24px rgba(0,0,0,.54);
-  --shadow-lg: 0 18px 46px rgba(0,0,0,.64);
-  --radius: 6px; --radius-sm: 4px;
+/* ===== 档案·夜:夜灯下的档案室 —— 深墨蓝桌面 + 米纸文字 + 提亮朱砂 ===== */
+[data-theme="archive-dark"] {
+  --bg: #141b26;
+  --panel: #1e2836;
+  --panel-soft: #253243;
+  --panel-2: #1a2330;
+  --text: #e7dfca;
+  --text-secondary: #b4ad97;
+  --text-tertiary: #74809a;
+  --border: rgba(231,223,202,.14);
+  --border-strong: rgba(231,223,202,.32);
+  --accent: #e06a4a;
+  --accent-hover: #eb8163;
+  --accent-ink: #201009;
+  --accent-soft: rgba(224,106,74,.16);
+  --shadow-sm: 0 2px 0 rgba(0,0,0,.32);
+  --shadow:    0 4px 0 rgba(0,0,0,.36);
+  --shadow-lg: 0 4px 0 rgba(0,0,0,.42), 10px 12px 0 rgba(0,0,0,.24);
+  --shadow-sel: 2px 3px 0 rgba(0,0,0,.45);
+  --ruling: rgba(231,223,202,.055);
+  --grain: rgba(231,223,202,.028);
+  --punch: rgba(231,223,202,.35);
 }
 
 * { box-sizing: border-box; }
@@ -2535,10 +2410,7 @@ html, body, #app {
   margin: 0; padding: 0; height: 100vh; overflow: hidden;
   background: var(--bg);
   color: var(--text);
-  font-family:
-    "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI",
-    "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB",
-    system-ui, sans-serif;
+  font-family: var(--font-ui);
   font-size: 13px; line-height: 1.5;
   user-select: none;
   -webkit-font-smoothing: antialiased;
@@ -2584,13 +2456,13 @@ html, body, #app {
 .mark .ic { width: 18px; height: 18px; stroke-width: 2; }
 .brand-text { display: flex; flex-direction: column; line-height: 1; }
 h1 {
-  margin: 0; font-family: inherit;
-  font-size: 14px; font-weight: 600; letter-spacing: -.01em;
+  margin: 0; font-family: var(--font-display);
+  font-size: 14px; font-weight: 700; letter-spacing: -.01em;
   color: var(--text); line-height: 1.15;
 }
 .sub {
   margin-top: 2px;
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 9.5px; letter-spacing: .04em; text-transform: uppercase;
   color: var(--text-tertiary);
 }
@@ -2621,7 +2493,7 @@ h1 {
 .cmd-clear:hover { color: var(--text); }
 .kbd {
   flex-shrink: 0; pointer-events: none; user-select: none;
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px; line-height: 1; color: var(--text-tertiary);
   border: 1px solid var(--border-strong); border-radius: 5px;
   padding: 3px 7px; background: var(--panel);
@@ -2711,7 +2583,7 @@ h1 {
 .theme-row-name { flex-shrink: 0; font-weight: 500; letter-spacing: 0; }
 .theme-row-id {
   margin-left: auto;
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10px; color: var(--text-tertiary);
 }
 .theme-row.active .theme-row-id { color: var(--accent); }
@@ -2729,7 +2601,7 @@ h1 {
   flex-shrink: 0;
 }
 .multi-count {
-  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  font-family: var(--font-mono);
   color: var(--accent); letter-spacing: 0; margin-right: 6px;
 }
 .multi-spacer { flex: 1; }
@@ -2772,7 +2644,7 @@ h1 {
 .eyebrow {
   display: flex; align-items: center; justify-content: space-between;
   margin: 0 0 8px; padding: 0 2px;
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
   color: var(--text-tertiary);
 }
@@ -2798,7 +2670,7 @@ h1 {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 .chip b {
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px; font-weight: 600; color: var(--text-tertiary);
 }
 .chip.active b { color: var(--accent); }
@@ -2864,7 +2736,7 @@ h1 {
 .tag-filter b {
   margin-left: 4px;
   color: var(--text-tertiary);
-  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
@@ -2877,7 +2749,7 @@ h1 {
 }
 .stat span { font-size: 10px; letter-spacing: .02em; color: var(--text-tertiary); }
 .stat b {
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 18px; font-weight: 600; line-height: 1; color: var(--accent);
 }
 
@@ -2930,7 +2802,7 @@ h1 {
 .ghostbtn:hover { color: var(--text); border-color: var(--border-strong); }
 .ghostbtn.active { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .head-count {
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px; color: var(--text-tertiary);
 }
 .queue { flex: 1; overflow-y: auto; padding: 2px 10px 10px; }
@@ -2967,7 +2839,7 @@ h1 {
 .mini-count {
   margin-left: auto;
   color: var(--text-tertiary);
-  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10px;
   white-space: nowrap;
   flex-shrink: 0;
@@ -2997,9 +2869,9 @@ h1 {
   content: ''; height: 1px; width: 14px;
   background: var(--border-strong);
 }
-.group-name { color: var(--text-secondary); }
+.group-name { color: var(--text-secondary); font-family: var(--font-display); }
 .group-count {
-  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10px; color: var(--text-tertiary);
 }
 
@@ -3042,7 +2914,7 @@ h1 {
   position: absolute; top: 6px; right: 8px; z-index: 1;
   min-width: 14px; height: 15px; padding: 0 3px;
   display: flex; align-items: center; justify-content: center;
-  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 9.5px; line-height: 1; font-weight: 600;
   color: var(--text-tertiary);
   background: var(--panel-soft);
@@ -3058,7 +2930,7 @@ h1 {
   width: 30px; height: 30px;
   border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
   display: flex; align-items: center; justify-content: center;
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 13px; font-weight: 500; color: var(--accent);
   background: var(--panel); flex-shrink: 0;
   transition: all var(--transition);
@@ -3070,7 +2942,7 @@ h1 {
 .item-main { min-width: 0; }
 .item-title {
   display: flex; align-items: center; gap: 8px;
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10px; letter-spacing: .04em; text-transform: uppercase;
   color: var(--text-tertiary); margin-bottom: 3px;
 }
@@ -3173,7 +3045,7 @@ h1 {
   display: inline-flex; align-items: center; gap: 4px;
   margin-right: 4px; padding: 2px 7px;
   border-radius: 5px; background: var(--accent-soft); color: var(--accent);
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10px; white-space: nowrap;
 }
 .mini-mode .enterhint { display: none; }
@@ -3326,7 +3198,7 @@ h1 {
   background: var(--panel-soft);
   border: 1px solid var(--border-strong);
   border-radius: 3px;
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10px;
   color: var(--accent);
   letter-spacing: 0;
@@ -3340,7 +3212,7 @@ h1 {
 
 /* 拖拽调试反馈 */
 .drag-debug {
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   color: var(--accent);
   font-size: 10px;
   letter-spacing: 0;
@@ -3366,13 +3238,13 @@ h1 {
   display: inline-block; padding: 1px 5px; margin: 0 4px 0 6px;
   background: var(--panel);
   border: 1px solid var(--border-strong); border-radius: 3px;
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10px; color: var(--text-secondary);
 }
 .footer kbd:first-child { margin-left: 0; }
 .count {
   flex-shrink: 0;
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   color: var(--text-secondary);
 }
 
@@ -3453,7 +3325,7 @@ h1 {
 .setting-label.small { font-size: 11px; margin-bottom: 5px; color: var(--text-tertiary); }
 .setting-control { display: flex; align-items: center; gap: 8px; }
 .hotkey-display, .hotkey-input {
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   padding: 6px 10px;
   background: var(--panel-soft);
@@ -3512,7 +3384,7 @@ h1 {
 .ocr-zoom-label {
   min-width: 44px;
   text-align: center;
-  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-secondary);
 }
@@ -3598,7 +3470,7 @@ h1 {
 }
 .privacy-status span:first-child {
   color: var(--accent);
-  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  font-family: var(--font-mono);
 }
 .pause-row {
   display: grid;
@@ -3633,7 +3505,7 @@ h1 {
   border-radius: var(--radius-sm);
 }
 .stat-num {
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 18px; color: var(--accent); line-height: 1;
 }
 .stat-name { margin-top: 4px; font-size: 10px; color: var(--text-tertiary); letter-spacing: 0; }
@@ -3662,7 +3534,7 @@ h1 {
   color: var(--text);
 }
 .stat-rank-count {
-  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  font-family: var(--font-mono);
   color: var(--accent); font-size: 11px; letter-spacing: 0;
 }
 
@@ -3732,29 +3604,6 @@ h1 {
   .ocr-body { grid-template-columns: 1fr; }
 }
 
-/* ===== 主题微调（仅个别皮肤需要的组件级处理） ===== */
-/* soft-ui 新拟物：表面与背景同色，靠柔和双向阴影分层（凸起卡片 / 内凹输入） */
-[data-theme="softui"] .item {
-  border-color: transparent;
-  box-shadow: var(--shadow-sm);
-}
-[data-theme="softui"] .item:hover { box-shadow: var(--shadow); border-color: transparent; }
-[data-theme="softui"] .command {
-  border-color: transparent;
-  box-shadow: inset 3px 3px 7px rgba(146,158,170,.32), inset -3px -3px 7px rgba(255,255,255,.82);
-}
-[data-theme="softui"] .stat,
-[data-theme="softui"] .toggle,
-[data-theme="softui"] .glyph {
-  border-color: transparent;
-  box-shadow: var(--shadow-sm);
-}
-[data-theme="softui"] .cmd-input { background: transparent; }
-
-/* swiss / editorial（含深色版）：硬朗描边主导，强调色块选中态更醒目 */
-[data-theme="swiss"] .item.selected,
-[data-theme="editorial"] .item.selected { box-shadow: var(--shadow-sm); }
-
 /* ===== Track 3 自动标签 / 色块 / 二维码 ===== */
 .auto-tag {
   font-size: 10.5px; line-height: 1;
@@ -3783,7 +3632,79 @@ h1 {
 .qr-text {
   font-size: 11px; color: var(--text-tertiary);
   word-break: break-all; text-align: center;
-  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
+
+/* ===== 档案设计语言:结构元素(置于末尾以覆盖基础规则;颜色走变量,档案·夜自动生效) ===== */
+/* 窗体:牛皮纸/夜档斜纹肌理 */
+.app { background-image: repeating-linear-gradient(45deg, transparent 0 10px, var(--grain) 10px 11px); }
+
+/* 索引卡:卡纸横线 + 常驻投影;hover 抬起;选中 = 偏移硬投影 */
+.item {
+  box-shadow: var(--shadow-sm);
+  background-image: repeating-linear-gradient(0deg, transparent 0 21px, var(--ruling) 21px 22px);
+  transition: border-color var(--transition), background var(--transition),
+    box-shadow var(--transition), transform .12s ease;
+}
+.item:hover { transform: translateY(-1px); box-shadow: var(--shadow); }
+.item.selected { box-shadow: var(--shadow-sel); }
+
+/* 左缘打孔(取代选中彩条) */
+.app .item::before {
+  content: ""; position: absolute; left: 4px; top: 50%; transform: translateY(-50%);
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--bg); border: 1px solid var(--punch); z-index: 1;
+}
+
+/* 蜡封收藏章 */
+.item.pinned::after {
+  content: "★"; position: absolute; right: -5px; top: -8px; z-index: 2;
+  width: 20px; height: 20px; border-radius: 50%;
+  background: var(--accent); color: var(--accent-ink);
+  display: flex; align-items: center; justify-content: center; font-size: 10px;
+  box-shadow: 0 2px 0 var(--accent-hover); transform: rotate(9deg);
+}
+
+/* 打字机流水号列(迷你模式收起) */
+.serial { display: none; }
+.app:not(.mini-mode) .item { grid-template-columns: 50px 30px 1fr auto; }
+.app:not(.mini-mode) .serial {
+  display: flex; align-items: center; height: 30px;
+  font-family: var(--font-mono); font-size: 10px; font-weight: 700; letter-spacing: .05em;
+  color: var(--text-tertiary); font-variant-numeric: tabular-nums;
+}
+.serial::before { content: "NO."; }
+.item.selected .serial { color: var(--accent); }
+
+/* 盖章式类型徽章(藏/图/链/邮/色/码/档/文) */
+.glyph {
+  background: transparent; border-width: 2px; border-color: var(--text-secondary);
+  color: var(--text); font-family: var(--font-display); font-weight: 700; font-size: 13px;
+  transform: rotate(-3deg);
+}
+.item.pinned .glyph { border-color: var(--accent); color: var(--accent); border-radius: 50%; }
+
+/* 分组头 = 抽屉标签 */
+.group-head::before { display: none; }
+.group-name {
+  font-family: var(--font-display); font-weight: 700; font-size: 12px;
+  color: var(--panel); background: var(--text);
+  padding: 3px 14px 3px 9px; border-radius: 2px;
+  clip-path: polygon(0 0, 100% 0, calc(100% - 8px) 100%, 0 100%);
+}
+.group-head::after { content: ""; flex: 1; border-top: 2px dotted var(--text-tertiary); }
+.group-count { font-family: var(--font-mono); }
+
+/* 品牌 = 圆形印章「贴」+ 打字机期号 */
+.mark {
+  background: transparent; border: 2px solid var(--accent); color: var(--accent);
+  border-radius: 50%; transform: rotate(-6deg);
+}
+.mark .ic { display: none; }
+.mark::before { content: "贴"; font-family: var(--font-display); font-weight: 700; font-size: 14px; }
+.sub { letter-spacing: .14em; }
+
+/* 小节标题衬线化 */
+.eyebrow { font-family: var(--font-display); font-weight: 700; }
 </style>
