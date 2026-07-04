@@ -122,6 +122,9 @@ struct AppState {
 
 fn init_db(db_path: &PathBuf) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
+    // WAL + NORMAL:写操作不再锁整库,轮询线程与 UI 命令并发更顺畅
+    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS clips (
@@ -917,13 +920,16 @@ fn increment_copy_count(id: i64, state: State<'_, AppState>) -> Result<(), Strin
 #[tauri::command]
 fn update_sort_order(orders: Vec<(i64, i64)>, state: State<'_, AppState>) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    // 单事务提交:拖一次可能写 200 行,逐条 autocommit 太慢
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     for (id, order) in orders {
-        conn.execute(
+        tx.execute(
             "UPDATE clips SET sort_order = ?1 WHERE id = ?2",
             params![order, id],
         )
         .map_err(|e| e.to_string())?;
     }
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1398,12 +1404,13 @@ fn import_history(path: String, state: State<'_, AppState>) -> Result<i64, Strin
     let payload: ExportPayload = serde_json::from_str(&s).map_err(|e| e.to_string())?;
 
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let mut imported = 0i64;
     for it in payload.items {
         match it.content_type.as_str() {
             "text" => {
                 if let Some(t) = &it.text {
-                    let exists: Option<i64> = conn
+                    let exists: Option<i64> = tx
                         .query_row(
                             "SELECT id FROM clips WHERE content_type='text' AND text = ?1",
                             params![t],
@@ -1411,7 +1418,7 @@ fn import_history(path: String, state: State<'_, AppState>) -> Result<i64, Strin
                         )
                         .ok();
                     if exists.is_none() {
-                        conn.execute(
+                        tx.execute(
                             "INSERT INTO clips (content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes) \
                              VALUES ('text', ?1, NULL, ?2, ?3, ?4, ?5, NULL, NULL, NULL)",
                             params![
@@ -1430,7 +1437,7 @@ fn import_history(path: String, state: State<'_, AppState>) -> Result<i64, Strin
                 // 图片只导入仍存在于磁盘的路径
                 if let Some(p) = &it.image_path {
                     if std::path::Path::new(p).exists() {
-                        conn.execute(
+                        tx.execute(
                             "INSERT INTO clips (content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes) \
                              VALUES ('image', NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                             params![
@@ -1451,6 +1458,7 @@ fn import_history(path: String, state: State<'_, AppState>) -> Result<i64, Strin
             _ => {}
         }
     }
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(imported)
 }
 
@@ -1460,17 +1468,19 @@ fn import_history(path: String, state: State<'_, AppState>) -> Result<i64, Strin
 fn batch_delete(ids: Vec<i64>, state: State<'_, AppState>) -> Result<(), String> {
     if ids.is_empty() { return Ok(()); }
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let mut paths_to_remove: Vec<String> = vec![];
     for id in &ids {
-        if let Ok((img, thumb)) = conn.query_row(
+        if let Ok((img, thumb)) = tx.query_row(
             "SELECT image_path, thumb_path FROM clips WHERE id = ?1",
             params![id],
             |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
         ) {
             paths_to_remove.extend([img, thumb].into_iter().flatten());
         }
-        let _ = conn.execute("DELETE FROM clips WHERE id = ?1", params![id]);
+        let _ = tx.execute("DELETE FROM clips WHERE id = ?1", params![id]);
     }
+    tx.commit().map_err(|e| e.to_string())?;
     drop(conn);
     for p in paths_to_remove {
         let _ = std::fs::remove_file(p);
@@ -1482,13 +1492,15 @@ fn batch_delete(ids: Vec<i64>, state: State<'_, AppState>) -> Result<(), String>
 fn batch_pin(ids: Vec<i64>, pinned: bool, state: State<'_, AppState>) -> Result<(), String> {
     if ids.is_empty() { return Ok(()); }
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     for id in ids {
-        let _ = conn.execute(
+        let _ = tx.execute(
             "UPDATE clips SET pinned = ?1, \
              sort_order = CASE WHEN ?1 = 0 THEN NULL ELSE sort_order END WHERE id = ?2",
             params![if pinned { 1 } else { 0 }, id],
         );
     }
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1671,10 +1683,15 @@ fn prepare_ocr_image(image_path: &str, crop: Option<OcrCrop>) -> Result<PathBuf,
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn extract_text_from_image(image_path: String, crop: Option<OcrCrop>) -> Result<String, String> {
-    let prepared_path = prepare_ocr_image(&image_path, crop)?;
-    let result = recognize_text_from_image_path(&prepared_path.to_string_lossy());
-    let _ = std::fs::remove_file(prepared_path);
-    result
+    // WinRT 识别与图片预处理全是同步阻塞调用,放进阻塞线程池,避免占死 async worker
+    tauri::async_runtime::spawn_blocking(move || {
+        let prepared_path = prepare_ocr_image(&image_path, crop)?;
+        let result = recognize_text_from_image_path(&prepared_path.to_string_lossy());
+        let _ = std::fs::remove_file(prepared_path);
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(not(target_os = "windows"))]

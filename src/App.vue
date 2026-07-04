@@ -342,6 +342,27 @@ async function refresh() {
   }
 }
 
+// clips-changed 防抖刷新;窗口隐藏在托盘时只标脏,回到前台再刷一次
+let refreshTimer: number | null = null;
+let refreshDirty = false;
+function scheduleRefresh() {
+  if (document.hidden) {
+    refreshDirty = true;
+    return;
+  }
+  if (refreshTimer != null) return;
+  refreshTimer = window.setTimeout(() => {
+    refreshTimer = null;
+    void refresh();
+  }, 300);
+}
+function onVisibilityChange() {
+  if (!document.hidden && refreshDirty) {
+    refreshDirty = false;
+    void refresh();
+  }
+}
+
 function timeMatches(ts: number, value: TimeFilter): boolean {
   const today0 = new Date(); today0.setHours(0, 0, 0, 0);
   const t0 = today0.getTime();
@@ -1394,14 +1415,16 @@ onMounted(async () => {
   await refresh();
   await loadPrivacyStatus();
   try { hotkeyValue.value = await invoke<string>("get_hotkey"); } catch { hotkeyValue.value = "Ctrl+Shift+V"; }
-  unlistenFns.push(await listen("clips-changed", () => refresh()));
+  unlistenFns.push(await listen("clips-changed", () => scheduleRefresh()));
   await setupDragDrop();
   window.addEventListener("keydown", onKeydown);
   window.addEventListener("click", onGlobalClick);
+  document.addEventListener("visibilitychange", onVisibilityChange);
   searchInput.value?.focus();
   const timer = setInterval(() => {
+    if (document.hidden) return; // 藏在托盘时不空转
     now.value = Date.now();
-    loadPrivacyStatus();
+    if (settingsOpen.value) loadPrivacyStatus(); // 隐私状态只在设置弹窗展示,无谓轮询省掉
   }, 30_000);
   onUnmounted(() => clearInterval(timer));
 });
@@ -1410,12 +1433,18 @@ onUnmounted(() => {
   unlistenFns.forEach((u) => u());
   window.removeEventListener("keydown", onKeydown);
   window.removeEventListener("click", onGlobalClick);
+  document.removeEventListener("visibilitychange", onVisibilityChange);
 });
 
 listen("tauri://focus", () => {
   searchInput.value?.focus();
   search.value = "";
   selectedIndex.value = 0;
+  // 隐藏期间若有新内容,回到前台立即补一次刷新
+  if (refreshDirty) {
+    refreshDirty = false;
+    void refresh();
+  }
 });
 </script>
 
