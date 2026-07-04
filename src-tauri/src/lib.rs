@@ -53,6 +53,7 @@ pub struct ClipItem {
     pub image_width: Option<u32>,
     pub image_height: Option<u32>,
     pub image_bytes: Option<i64>,
+    pub sort_order: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -225,13 +226,14 @@ fn row_to_item(row: &rusqlite::Row) -> rusqlite::Result<ClipItem> {
         image_width: row.get::<_, Option<i64>>(8).ok().flatten().map(|v| v as u32),
         image_height: row.get::<_, Option<i64>>(9).ok().flatten().map(|v| v as u32),
         image_bytes: row.get::<_, Option<i64>>(10).ok().flatten(),
+        sort_order: row.get::<_, Option<i64>>(11).ok().flatten(),
     })
 }
 
 fn query_all_items(conn: &Connection) -> rusqlite::Result<Vec<ClipItem>> {
     let mut stmt = conn.prepare(
-        "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes \
-         FROM clips ORDER BY sort_order ASC NULLS LAST, created_at DESC",
+        "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order \
+         FROM clips ORDER BY created_at DESC",
     )?;
     let items = stmt
         .query_map([], row_to_item)?
@@ -241,7 +243,7 @@ fn query_all_items(conn: &Connection) -> rusqlite::Result<Vec<ClipItem>> {
 
 fn query_recent(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<ClipItem>> {
     let mut stmt = conn.prepare(
-        "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes \
+        "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order \
          FROM clips ORDER BY created_at DESC LIMIT ?1",
     )?;
     let items = stmt
@@ -563,6 +565,14 @@ fn parse_shortcut(combo: &str) -> Result<Shortcut, String> {
         }
     }
     let c = code.ok_or_else(|| format!("无法解析按键: {}", combo))?;
+    // 无强修饰键的裸键注册后会吞掉全系统同名按键;仅功能键 F1-F24 允许单独使用
+    let is_fn_key = {
+        let name = format!("{:?}", c);
+        name.starts_with('F') && name.len() >= 2 && name[1..].chars().all(|ch| ch.is_ascii_digit())
+    };
+    if !mods.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::META) && !is_fn_key {
+        return Err("快捷键需包含 Ctrl / Alt / Win 中至少一个修饰键(功能键 F1-F24 可单独使用)".to_string());
+    }
     Ok(Shortcut::new(Some(mods), c))
 }
 
@@ -650,7 +660,7 @@ fn pick_item(
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes \
+                "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order \
                  FROM clips WHERE id = ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -758,7 +768,7 @@ fn paste_sequence(
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes \
+                "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order \
                  FROM clips WHERE id = ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -859,8 +869,10 @@ fn reveal_path(path: String) -> Result<(), String> {
 #[tauri::command]
 fn toggle_pin(id: i64, state: State<'_, AppState>) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    // 取消收藏时清掉 sort_order,避免残留的手动排序值影响后续再收藏时的顺序
     conn.execute(
-        "UPDATE clips SET pinned = 1 - pinned WHERE id = ?1",
+        "UPDATE clips SET sort_order = CASE WHEN pinned = 1 THEN NULL ELSE sort_order END, \
+         pinned = 1 - pinned WHERE id = ?1",
         params![id],
     )
     .map_err(|e| e.to_string())?;
@@ -1444,7 +1456,8 @@ fn batch_pin(ids: Vec<i64>, pinned: bool, state: State<'_, AppState>) -> Result<
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     for id in ids {
         let _ = conn.execute(
-            "UPDATE clips SET pinned = ?1 WHERE id = ?2",
+            "UPDATE clips SET pinned = ?1, \
+             sort_order = CASE WHEN ?1 = 0 THEN NULL ELSE sort_order END WHERE id = ?2",
             params![if pinned { 1 } else { 0 }, id],
         );
     }
@@ -1473,7 +1486,7 @@ fn get_stats(state: State<'_, AppState>) -> Result<Stats, String> {
         .unwrap_or(0);
 
     let mut stmt = conn.prepare(
-        "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes \
+        "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order \
          FROM clips WHERE copy_count > 0 ORDER BY copy_count DESC LIMIT 5",
     ).map_err(|e| e.to_string())?;
     let top_items: Vec<ClipItem> = stmt
@@ -1701,10 +1714,13 @@ pub fn run() {
                     })
                     .build(),
             )?;
-            app.global_shortcut().register(initial_shortcut.clone())?;
-            {
-                let st = app.state::<AppState>();
-                *st.current_hotkey.lock().unwrap() = Some(initial_shortcut);
+            // 快捷键可能被其它程序抢注:注册失败只提示,不能让应用启动即崩溃
+            match app.global_shortcut().register(initial_shortcut.clone()) {
+                Ok(()) => {
+                    let st = app.state::<AppState>();
+                    *st.current_hotkey.lock().unwrap() = Some(initial_shortcut);
+                }
+                Err(e) => eprintln!("注册全局快捷键失败(可能已被其它程序占用): {e}"),
             }
 
             // ---------- 系统托盘 ----------

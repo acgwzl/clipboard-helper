@@ -19,6 +19,7 @@ interface ClipItem {
   image_width: number | null;
   image_height: number | null;
   image_bytes: number | null;
+  sort_order: number | null;
 }
 
 interface Stats {
@@ -181,10 +182,21 @@ async function togglePinned() {
   pinned.value = !pinned.value;
 }
 
+// 收藏视图的显示顺序:手动拖拽过的(有 sort_order)按值升序在前,其余按时间倒序
+function sortPinned(list: ClipItem[]): ClipItem[] {
+  return [...list].sort((a, b) => {
+    const ao = a.sort_order, bo = b.sort_order;
+    if (ao != null && bo != null && ao !== bo) return ao - bo;
+    if (ao != null && bo == null) return -1;
+    if (ao == null && bo != null) return 1;
+    return b.created_at - a.created_at;
+  });
+}
+
 const filtered = computed(() => {
   let list = items.value;
   if (filter.value === "pinned") {
-    list = list.filter((i) => i.pinned);
+    list = sortPinned(list.filter((i) => i.pinned));
   } else {
     // 收藏项在普通视图也显示
     if (filter.value === "text") list = list.filter((i) => i.content_type === "text");
@@ -491,8 +503,8 @@ async function onDrop(targetItem: ClipItem, e: DragEvent) {
     dropTargetId.value = null;
     return;
   }
-  // 重新排序:拖拽的条目移到目标位置
-  const pinnedItems = items.value.filter(it => it.pinned);
+  // 重新排序:基于收藏视图的「显示顺序」计算位置(items 本身按时间排)
+  const pinnedItems = sortPinned(items.value.filter(it => it.pinned));
   const dragIdx = pinnedItems.findIndex(it => it.id === draggedItemId.value);
   const dropIdx = pinnedItems.findIndex(it => it.id === targetItem.id);
   if (dragIdx === -1 || dropIdx === -1) return;
@@ -692,14 +704,21 @@ function captureHotkey(e: KeyboardEvent) {
   e.preventDefault();
   e.stopPropagation();
   if (["Control","Shift","Alt","Meta"].includes(e.key)) return;
+  let main = e.key;
+  if (main.length === 1) main = main.toUpperCase();
+  if (main === " ") main = "Space";
+  // 无强修饰键的裸键会吞掉全系统同名按键,禁止录入(功能键 F1-F24 例外)
+  const isFnKey = /^F([1-9]|1\d|2[0-4])$/.test(main);
+  if (!(e.ctrlKey || e.altKey || e.metaKey) && !isFnKey) {
+    hotkeyError.value = "需包含 Ctrl / Alt / Win 修饰键(F1-F24 可单独使用)";
+    return;
+  }
+  hotkeyError.value = "";
   const parts: string[] = [];
   if (e.ctrlKey)  parts.push("Ctrl");
   if (e.shiftKey) parts.push("Shift");
   if (e.altKey)   parts.push("Alt");
   if (e.metaKey)  parts.push("Meta");
-  let main = e.key;
-  if (main.length === 1) main = main.toUpperCase();
-  if (main === " ") main = "Space";
   parts.push(main);
   hotkeyValue.value = parts.join("+");
 }
