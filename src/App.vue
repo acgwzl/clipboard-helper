@@ -733,8 +733,7 @@ async function saveHotkey() {
 }
 
 // 开机自启
-const autostartOn = ref(false);
-async function loadAutostart() {
+const autostartOn = ref(false);async function loadAutostart() {
   try { autostartOn.value = await invoke<boolean>("get_autostart"); } catch { autostartOn.value = false; }
 }
 async function toggleAutostart() {
@@ -745,6 +744,21 @@ async function toggleAutostart() {
   } catch (e: any) {
     showToast("设置失败: " + e);
   }
+}
+
+// 首次运行引导
+const onboardOpen = ref(false);
+const onboardAutostart = ref(true);
+async function finishOnboarding() {
+  if (onboardAutostart.value) {
+    try {
+      await invoke("set_autostart", { enable: true });
+      autostartOn.value = true;
+    } catch { /* 引导流程里失败不打断 */ }
+  }
+  try { await invoke("set_onboarded"); } catch { /* 同上 */ }
+  onboardOpen.value = false;
+  searchInput.value?.focus();
 }
 
 async function loadPrivacyStatus() {
@@ -1330,6 +1344,13 @@ function onKeydown(e: KeyboardEvent) {
     searchInput.value?.select();
     return;
   }
+  if (onboardOpen.value) {
+    if (e.key === "Escape" || e.key === "Enter") {
+      e.preventDefault();
+      void finishOnboarding();
+    }
+    return;
+  }
   if (confirmState.value) {
     if (e.key === "Escape") answerConfirm(false);
     else if (e.key === "Enter") { e.preventDefault(); answerConfirm(true); }
@@ -1470,6 +1491,9 @@ onMounted(async () => {
   await loadPrivacyStatus();
   try { hotkeyValue.value = await invoke<string>("get_hotkey"); } catch { hotkeyValue.value = "Ctrl+Shift+V"; }
   unlistenFns.push(await listen("clips-changed", () => scheduleRefresh()));
+  try {
+    if (!(await invoke<boolean>("get_onboarded"))) onboardOpen.value = true;
+  } catch { /* 引导检测失败按已引导处理 */ }
   await setupDragDrop();
   window.addEventListener("keydown", onKeydown);
   window.addEventListener("click", onGlobalClick);
@@ -2384,6 +2408,27 @@ void listen("tauri://focus", () => {
       <div class="drag-mask-inner">
         <div class="drag-glyph">↓</div>
         <div class="drag-text">松开以加入剪贴板</div>
+      </div>
+    </div>
+
+    <!-- 首次运行引导 -->
+    <div v-if="onboardOpen" class="modal-bg">
+      <div class="confirm-panel onboard-panel" @click.stop>
+        <div class="onboard-mark" aria-hidden="true">贴</div>
+        <h2 class="onboard-title">剪贴板助手</h2>
+        <p class="onboard-sub">ARCHIVE · 你的剪贴板档案馆</p>
+        <ul class="onboard-list">
+          <li><kbd>Ctrl+Shift+V</kbd> 随时唤起 / 隐藏本窗口(可在设置中修改)</li>
+          <li>复制的文本与图片会自动登记入档,点击条目即写回剪贴板并粘贴</li>
+          <li>关闭按钮只是隐藏到托盘;退出请用托盘右键菜单</li>
+        </ul>
+        <button class="toggle onboard-toggle" @click="onboardAutostart = !onboardAutostart">
+          <span>随系统启动(推荐,可在设置中更改)</span>
+          <span class="switch" :class="{ on: onboardAutostart }" aria-hidden="true"></span>
+        </button>
+        <div class="confirm-actions">
+          <button class="setting-btn primary onboard-go" @click="finishOnboarding">开始使用</button>
+        </div>
       </div>
     </div>
 
@@ -3788,4 +3833,35 @@ h1 {
   font-size: 12px; box-shadow: var(--shadow);
 }
 .mini-mode .toast { bottom: 10px; }
+
+/* ===== 首次运行引导 ===== */
+.onboard-panel { width: min(430px, 90vw); padding: 26px 26px 20px; text-align: center; }
+.onboard-mark {
+  width: 52px; height: 52px; margin: 0 auto 10px;
+  display: grid; place-items: center;
+  border: 2px solid var(--accent); border-radius: 50%;
+  color: var(--accent); font-family: var(--font-display);
+  font-weight: 700; font-size: 24px; transform: rotate(-6deg);
+}
+.onboard-title { margin: 0; font-family: var(--font-display); font-size: 20px; font-weight: 700; color: var(--text); }
+.onboard-sub {
+  margin: 4px 0 16px; font-family: var(--font-mono);
+  font-size: 10px; letter-spacing: .18em; color: var(--text-tertiary);
+}
+.onboard-list {
+  margin: 0 0 16px; padding: 14px 16px; list-style: none; text-align: left;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius);
+  display: flex; flex-direction: column; gap: 9px;
+  font-size: 12.5px; line-height: 1.6; color: var(--text-secondary);
+}
+.onboard-list li { padding-left: 16px; position: relative; }
+.onboard-list li::before { content: "▪"; position: absolute; left: 0; color: var(--accent); }
+.onboard-list kbd {
+  font-family: var(--font-mono); font-size: 11px; color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: 4px;
+  padding: 1px 6px; background: var(--panel);
+}
+.onboard-toggle { width: 100%; }
+.onboard-panel .confirm-actions { justify-content: center; margin-top: 14px; }
+.onboard-go { min-width: 160px; }
 </style>

@@ -1281,6 +1281,20 @@ fn set_autostart(enable: bool, app: AppHandle) -> Result<(), String> {
     }
 }
 
+// ---------- 首次运行引导 ----------
+
+#[tauri::command]
+fn get_onboarded(state: State<'_, AppState>) -> bool {
+    let conn = lock_ok(&state.db);
+    read_setting(&conn, "onboarded").is_some()
+}
+
+#[tauri::command]
+fn set_onboarded(state: State<'_, AppState>) -> Result<(), String> {
+    let conn = lock_ok(&state.db);
+    write_setting(&conn, "onboarded", "1").map_err(|e| e.to_string())
+}
+
 // ---------- 自定义快捷键 ----------
 
 #[tauri::command]
@@ -1819,6 +1833,26 @@ async fn extract_text_from_image(_image_path: String, _crop: Option<OcrCrop>) ->
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 单实例锁必须最先注册:二次启动时唤起已有实例的窗口后立即退出新进程
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("clipboard-helper".into()),
+                    }),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                ])
+                .level(log::LevelFilter::Info)
+                .max_file_size(512_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .build(),
+        )
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -1837,6 +1871,13 @@ pub fn run() {
             let db_path = app_data_dir.join("clips.db");
 
             let conn = init_db(&db_path).expect("failed to init db");
+            log::info!(
+                "剪贴板助手 v{} 启动,数据目录 {}",
+                env!("CARGO_PKG_VERSION"),
+                app_data_dir.display()
+            );
+            // 首次运行(从未完成引导)则亮出主窗口,否则保持托盘静默
+            let first_run = read_setting(&conn, "onboarded").is_none();
 
             // 清理旧版本 prune 泄漏的孤儿图片
             cleanup_orphan_images(&conn, &images_dir);
@@ -1883,7 +1924,7 @@ pub fn run() {
                     let st = app.state::<AppState>();
                     *st.current_hotkey.lock().unwrap() = Some(initial_shortcut);
                 }
-                Err(e) => eprintln!("注册全局快捷键失败(可能已被其它程序占用): {e}"),
+                Err(e) => log::warn!("注册全局快捷键失败(可能已被其它程序占用): {e}"),
             }
 
             // ---------- 系统托盘 ----------
@@ -2140,7 +2181,7 @@ pub fn run() {
                                         r
                                     }
                                     Err(e) => {
-                                        eprintln!("save image failed: {}", e);
+                                        log::error!("保存剪贴板图片失败: {}", e);
                                         false
                                     }
                                 }
@@ -2156,6 +2197,13 @@ pub fn run() {
 
             // 启动时也刷新一次托盘
             let _ = rebuild_tray_menu(&app_handle);
+
+            if first_run {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
 
             Ok(())
         })
@@ -2184,6 +2232,8 @@ pub fn run() {
             set_hotkey,
             get_autostart,
             set_autostart,
+            get_onboarded,
+            set_onboarded,
             transform_text,
             replace_text,
             extract_text_from_image,
