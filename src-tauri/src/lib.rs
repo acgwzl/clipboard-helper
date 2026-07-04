@@ -285,10 +285,45 @@ fn prune_old(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     for (id, path) in to_delete {
         conn.execute("DELETE FROM clips WHERE id = ?1", params![id])?;
         if let Some(p) = path {
+            // 行删除的同时删除对应 PNG,否则被挤出历史的图片文件会永久残留磁盘
+            let _ = std::fs::remove_file(&p);
             image_paths.push(p);
         }
     }
     Ok(image_paths)
+}
+
+/// 启动时清扫 images 目录中已无数据库记录引用的孤儿 PNG(回收旧版本泄漏的空间)
+fn cleanup_orphan_images(conn: &Connection, images_dir: &std::path::Path) {
+    use std::collections::HashSet;
+    let mut referenced: HashSet<String> = HashSet::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT image_path FROM clips WHERE image_path IS NOT NULL") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for p in rows.flatten() {
+                if let Some(name) = std::path::Path::new(&p).file_name() {
+                    referenced.insert(name.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(images_dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_png = path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("png"))
+            .unwrap_or(false);
+        if !is_png {
+            continue;
+        }
+        let orphan = path
+            .file_name()
+            .map(|n| !referenced.contains(&n.to_string_lossy().to_string()))
+            .unwrap_or(false);
+        if orphan {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 fn read_setting(conn: &Connection, key: &str) -> Option<String> {
@@ -635,8 +670,9 @@ fn pick_item(
             let path = item.image_path.clone().ok_or("image_path missing")?;
             let img = load_image_for_clipboard(&path)?;
             app.clipboard().write_image(&img).map_err(|e| e.to_string())?;
-            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-            *state.last_hash.lock().unwrap() = hash_bytes(&bytes);
+            // 必须与轮询同数据源(解码后 RGBA)计算哈希;此前哈希 PNG 文件字节,
+            // 与轮询的 RGBA 哈希永不相等 → 每次选图都被再次入库
+            *state.last_hash.lock().unwrap() = hash_bytes(img.rgba());
         }
         _ => return Err("unknown content type".to_string()),
     }
@@ -751,10 +787,20 @@ fn paste_sequence(
 
     // 预记录最后一项 hash，减少序列结束后轮询重复入库
     if let Some(last) = items.last() {
-        if last.content_type == "text" {
-            if let Some(t) = &last.text {
-                *state.last_hash.lock().unwrap() = hash_bytes(t.as_bytes());
+        match last.content_type.as_str() {
+            "text" => {
+                if let Some(t) = &last.text {
+                    *state.last_hash.lock().unwrap() = hash_bytes(t.as_bytes());
+                }
             }
+            "image" => {
+                if let Some(p) = &last.image_path {
+                    if let Ok(img) = load_image_for_clipboard(p) {
+                        *state.last_hash.lock().unwrap() = hash_bytes(img.rgba());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1613,6 +1659,9 @@ pub fn run() {
 
             let conn = init_db(&db_path).expect("failed to init db");
 
+            // 清理旧版本 prune 泄漏的孤儿图片
+            cleanup_orphan_images(&conn, &images_dir);
+
             // 读出保存过的快捷键
             let saved_hotkey = read_setting(&conn, "hotkey").unwrap_or_else(|| DEFAULT_HOTKEY.to_string());
 
@@ -1759,8 +1808,23 @@ pub fn run() {
             // ---------- 后台轮询剪贴板 ----------
             let poll_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
+                // Windows 剪贴板序列号:内容未变时跳过整个 tick,避免空转读图/查库
+                #[cfg(target_os = "windows")]
+                let mut last_seq: u32 = 0;
                 loop {
                     tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+
+                    #[cfg(target_os = "windows")]
+                    {
+                        let seq = unsafe {
+                            windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber()
+                        };
+                        // seq==0 表示查询失败,此时退回逐 tick 检查
+                        if seq != 0 && seq == last_seq {
+                            continue;
+                        }
+                        last_seq = seq;
+                    }
 
                     let clipboard = poll_handle.clipboard();
                     let state = poll_handle.state::<AppState>();
@@ -1777,7 +1841,7 @@ pub fn run() {
                             }
                         }
                         if let Ok(img) = clipboard.read_image() {
-                            *state.last_hash.lock().unwrap() = hash_bytes(&img.rgba().to_vec());
+                            *state.last_hash.lock().unwrap() = hash_bytes(img.rgba());
                         }
                         continue;
                     }
@@ -1815,8 +1879,7 @@ pub fn run() {
                     }
 
                     if let Ok(img) = clipboard.read_image() {
-                        let rgba_bytes = img.rgba().to_vec();
-                        let h = hash_bytes(&rgba_bytes);
+                        let h = hash_bytes(img.rgba());
                         let mut last = state.last_hash.lock().unwrap();
                         if *last != h {
                             *last = h;
