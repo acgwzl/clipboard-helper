@@ -53,7 +53,11 @@ pub struct ClipItem {
     pub image_width: Option<u32>,
     pub image_height: Option<u32>,
     pub image_bytes: Option<i64>,
+    // 后加的列:旧导出 JSON 里没有,导入时按缺省处理
+    #[serde(default)]
     pub sort_order: Option<i64>,
+    #[serde(default)]
+    pub thumb_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -152,6 +156,7 @@ fn init_db(db_path: &PathBuf) -> rusqlite::Result<Connection> {
     }
     ensure_column(&conn, "clips", "tags", "TEXT NOT NULL DEFAULT '[]'")?;
     ensure_column(&conn, "clips", "sort_order", "INTEGER")?; // nullable,手动排序用
+    ensure_column(&conn, "clips", "thumb_path", "TEXT")?; // 列表缩略图(最长边 320px)
     ensure_column(&conn, "clips", "image_width", "INTEGER")?;
     ensure_column(&conn, "clips", "image_height", "INTEGER")?;
     ensure_column(&conn, "clips", "image_bytes", "INTEGER")?;
@@ -227,12 +232,13 @@ fn row_to_item(row: &rusqlite::Row) -> rusqlite::Result<ClipItem> {
         image_height: row.get::<_, Option<i64>>(9).ok().flatten().map(|v| v as u32),
         image_bytes: row.get::<_, Option<i64>>(10).ok().flatten(),
         sort_order: row.get::<_, Option<i64>>(11).ok().flatten(),
+        thumb_path: row.get::<_, Option<String>>(12).ok().flatten(),
     })
 }
 
 fn query_all_items(conn: &Connection) -> rusqlite::Result<Vec<ClipItem>> {
     let mut stmt = conn.prepare(
-        "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order \
+        "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order, thumb_path \
          FROM clips ORDER BY created_at DESC",
     )?;
     let items = stmt
@@ -243,7 +249,7 @@ fn query_all_items(conn: &Connection) -> rusqlite::Result<Vec<ClipItem>> {
 
 fn query_recent(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<ClipItem>> {
     let mut stmt = conn.prepare(
-        "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order \
+        "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order, thumb_path \
          FROM clips ORDER BY created_at DESC LIMIT ?1",
     )?;
     let items = stmt
@@ -261,33 +267,40 @@ fn insert_text(conn: &Connection, text: &str) -> rusqlite::Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
-fn insert_image(conn: &Connection, path: &str, width: u32, height: u32, bytes: i64) -> rusqlite::Result<i64> {
+fn insert_image(
+    conn: &Connection,
+    path: &str,
+    thumb_path: Option<&str>,
+    width: u32,
+    height: u32,
+    bytes: i64,
+) -> rusqlite::Result<i64> {
     conn.execute(
-        "INSERT INTO clips (content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes) \
-         VALUES ('image', NULL, ?1, 0, ?2, 0, '[]', ?3, ?4, ?5)",
-        params![path, Utc::now().timestamp_millis(), width as i64, height as i64, bytes],
+        "INSERT INTO clips (content_type, text, image_path, thumb_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes) \
+         VALUES ('image', NULL, ?1, ?2, 0, ?3, 0, '[]', ?4, ?5, ?6)",
+        params![path, thumb_path, Utc::now().timestamp_millis(), width as i64, height as i64, bytes],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
 fn prune_old(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT id, image_path FROM clips \
+        "SELECT id, image_path, thumb_path FROM clips \
          WHERE pinned = 0 \
          ORDER BY created_at DESC \
          LIMIT -1 OFFSET ?1",
     )?;
-    let to_delete: Vec<(i64, Option<String>)> = stmt
+    let to_delete: Vec<(i64, Option<String>, Option<String>)> = stmt
         .query_map(params![MAX_UNPINNED_HISTORY], |r| {
-            Ok((r.get(0)?, r.get(1)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut image_paths = vec![];
-    for (id, path) in to_delete {
+    for (id, path, thumb) in to_delete {
         conn.execute("DELETE FROM clips WHERE id = ?1", params![id])?;
-        if let Some(p) = path {
-            // 行删除的同时删除对应 PNG,否则被挤出历史的图片文件会永久残留磁盘
+        // 行删除的同时删除对应 PNG(含缩略图),否则被挤出历史的图片文件会永久残留磁盘
+        for p in [path, thumb].into_iter().flatten() {
             let _ = std::fs::remove_file(&p);
             image_paths.push(p);
         }
@@ -299,11 +312,15 @@ fn prune_old(conn: &Connection) -> rusqlite::Result<Vec<String>> {
 fn cleanup_orphan_images(conn: &Connection, images_dir: &std::path::Path) {
     use std::collections::HashSet;
     let mut referenced: HashSet<String> = HashSet::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT image_path FROM clips WHERE image_path IS NOT NULL") {
-        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
-            for p in rows.flatten() {
-                if let Some(name) = std::path::Path::new(&p).file_name() {
-                    referenced.insert(name.to_string_lossy().to_string());
+    if let Ok(mut stmt) = conn.prepare("SELECT image_path, thumb_path FROM clips WHERE image_path IS NOT NULL") {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        }) {
+            for (p, t) in rows.flatten() {
+                for path in std::iter::once(p).chain(t) {
+                    if let Some(name) = std::path::Path::new(&path).file_name() {
+                        referenced.insert(name.to_string_lossy().to_string());
+                    }
                 }
             }
         }
@@ -365,10 +382,25 @@ fn toggle_window(app: &AppHandle) {
     }
 }
 
+/// 为图片生成列表缩略图(最长边 320px);原图本身足够小则返回 None(前端直接用原图)
+fn make_thumbnail(src_path: &str) -> Option<String> {
+    const THUMB_MAX: u32 = 320;
+    let img = image::open(src_path).ok()?;
+    if img.width() <= THUMB_MAX && img.height() <= THUMB_MAX {
+        return None;
+    }
+    let thumb = img.thumbnail(THUMB_MAX, THUMB_MAX);
+    let thumb_path = format!("{}.thumb.png", src_path.trim_end_matches(".png"));
+    thumb
+        .save_with_format(&thumb_path, image::ImageFormat::Png)
+        .ok()?;
+    Some(thumb_path)
+}
+
 fn save_clipboard_image(
     raw: &tauri::image::Image<'_>,
     images_dir: &PathBuf,
-) -> Result<(String, u32, u32, i64), String> {
+) -> Result<(String, Option<String>, u32, u32, i64), String> {
     use image::{ImageBuffer, Rgba};
     let width = raw.width();
     let height = raw.height();
@@ -381,7 +413,9 @@ fn save_clipboard_image(
     rgba.save_with_format(&path, image::ImageFormat::Png)
         .map_err(|e| e.to_string())?;
     let bytes = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
-    Ok((path.to_string_lossy().to_string(), width, height, bytes))
+    let path_str = path.to_string_lossy().to_string();
+    let thumb = make_thumbnail(&path_str);
+    Ok((path_str, thumb, width, height, bytes))
 }
 
 fn load_image_for_clipboard(
@@ -638,18 +672,6 @@ fn get_items(state: State<'_, AppState>) -> Result<Vec<ClipItem>, String> {
 }
 
 #[tauri::command]
-fn read_image_as_data_url(path: String) -> Result<String, String> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    Ok(format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(&buf)
-    ))
-}
-
-#[tauri::command]
 fn pick_item(
     id: i64,
     auto_paste: bool,
@@ -660,7 +682,7 @@ fn pick_item(
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order \
+                "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order, thumb_path \
                  FROM clips WHERE id = ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -768,7 +790,7 @@ fn paste_sequence(
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order \
+                "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order, thumb_path \
                  FROM clips WHERE id = ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -908,18 +930,20 @@ fn update_sort_order(orders: Vec<(i64, i64)>, state: State<'_, AppState>) -> Res
 #[tauri::command]
 fn delete_item(id: i64, state: State<'_, AppState>) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let img_path: Option<String> = conn
+    let paths: Option<(Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT image_path FROM clips WHERE id = ?1",
+            "SELECT image_path, thumb_path FROM clips WHERE id = ?1",
             params![id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .ok();
     conn.execute("DELETE FROM clips WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     drop(conn);
-    if let Some(p) = img_path {
-        let _ = std::fs::remove_file(p);
+    if let Some((img, thumb)) = paths {
+        for p in [img, thumb].into_iter().flatten() {
+            let _ = std::fs::remove_file(p);
+        }
     }
     Ok(())
 }
@@ -928,10 +952,10 @@ fn delete_item(id: i64, state: State<'_, AppState>) -> Result<(), String> {
 fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
-        .prepare("SELECT image_path FROM clips WHERE pinned = 0 AND image_path IS NOT NULL")
+        .prepare("SELECT image_path, thumb_path FROM clips WHERE pinned = 0 AND image_path IS NOT NULL")
         .map_err(|e| e.to_string())?;
-    let paths: Vec<String> = stmt
-        .query_map([], |r| r.get(0))
+    let paths: Vec<(String, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
@@ -939,8 +963,10 @@ fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
     conn.execute("DELETE FROM clips WHERE pinned = 0", [])
         .map_err(|e| e.to_string())?;
     drop(conn);
-    for p in paths {
-        let _ = std::fs::remove_file(p);
+    for (img, thumb) in paths {
+        for p in std::iter::once(img).chain(thumb) {
+            let _ = std::fs::remove_file(p);
+        }
     }
     Ok(())
 }
@@ -1149,8 +1175,10 @@ fn add_file_path(path: String, state: State<'_, AppState>) -> Result<(), String>
         rgba.save_with_format(&dest, image::ImageFormat::Png)
             .map_err(|e| e.to_string())?;
         let bytes = std::fs::metadata(&dest).map(|m| m.len() as i64).unwrap_or(0);
+        let dest_str = dest.to_string_lossy().to_string();
+        let thumb = make_thumbnail(&dest_str);
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        let _ = insert_image(&conn, &dest.to_string_lossy(), width, height, bytes);
+        let _ = insert_image(&conn, &dest_str, thumb.as_deref(), width, height, bytes);
         let _ = prune_old(&conn);
         Ok(())
     } else if is_text {
@@ -1434,12 +1462,12 @@ fn batch_delete(ids: Vec<i64>, state: State<'_, AppState>) -> Result<(), String>
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let mut paths_to_remove: Vec<String> = vec![];
     for id in &ids {
-        if let Ok(Some(p)) = conn.query_row(
-            "SELECT image_path FROM clips WHERE id = ?1",
+        if let Ok((img, thumb)) = conn.query_row(
+            "SELECT image_path, thumb_path FROM clips WHERE id = ?1",
             params![id],
-            |r| r.get::<_, Option<String>>(0),
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
         ) {
-            paths_to_remove.push(p);
+            paths_to_remove.extend([img, thumb].into_iter().flatten());
         }
         let _ = conn.execute("DELETE FROM clips WHERE id = ?1", params![id]);
     }
@@ -1486,7 +1514,7 @@ fn get_stats(state: State<'_, AppState>) -> Result<Stats, String> {
         .unwrap_or(0);
 
     let mut stmt = conn.prepare(
-        "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order \
+        "SELECT id, content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes, sort_order, thumb_path \
          FROM clips WHERE copy_count > 0 ORDER BY copy_count DESC LIMIT 5",
     ).map_err(|e| e.to_string())?;
     let top_items: Vec<ClipItem> = stmt
@@ -1821,6 +1849,43 @@ pub fn run() {
                 let _ = rebuild_tray_menu(&tray_handle);
             });
 
+            // ---------- 旧图片后台补生成缩略图(一次性) ----------
+            let backfill_handle = app_handle.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let state = backfill_handle.state::<AppState>();
+                let todo: Vec<(i64, String)> = {
+                    let conn = state.db.lock().unwrap();
+                    let mut stmt = match conn.prepare(
+                        "SELECT id, image_path FROM clips \
+                         WHERE content_type = 'image' AND image_path IS NOT NULL AND thumb_path IS NULL",
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let rows: Vec<(i64, String)> =
+                        match stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))) {
+                            Ok(rows) => rows.flatten().collect(),
+                            Err(_) => return,
+                        };
+                    rows
+                };
+                let mut changed = false;
+                for (id, path) in todo {
+                    // 编码在锁外进行,只有写回时短暂持锁
+                    if let Some(tp) = make_thumbnail(&path) {
+                        let conn = state.db.lock().unwrap();
+                        let _ = conn.execute(
+                            "UPDATE clips SET thumb_path = ?1 WHERE id = ?2",
+                            params![tp, id],
+                        );
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let _ = backfill_handle.emit("clips-changed", ());
+                }
+            });
+
             // ---------- 后台轮询剪贴板 ----------
             let poll_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
@@ -1901,9 +1966,9 @@ pub fn run() {
                             *last = h;
                             drop(last);
                             match save_clipboard_image(&img, &state.images_dir) {
-                                Ok((path, width, height, bytes)) => {
+                                Ok((path, thumb, width, height, bytes)) => {
                                     let conn = state.db.lock().unwrap();
-                                    let _ = insert_image(&conn, &path, width, height, bytes);
+                                    let _ = insert_image(&conn, &path, thumb.as_deref(), width, height, bytes);
                                     let _ = prune_old(&conn);
                                     drop(conn);
                                     let _ = poll_handle.emit("clips-changed", ());
@@ -1939,7 +2004,6 @@ pub fn run() {
             get_privacy_status,
             set_privacy_settings,
             pause_clipboard,
-            read_image_as_data_url,
             add_text,
             create_snippet,
             add_file_path,

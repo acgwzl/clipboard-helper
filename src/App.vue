@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -20,6 +20,7 @@ interface ClipItem {
   image_height: number | null;
   image_bytes: number | null;
   sort_order: number | null;
+  thumb_path: string | null;
 }
 
 interface Stats {
@@ -102,10 +103,6 @@ const draggedItemId = ref<number | null>(null);
 const dropTargetId = ref<number | null>(null);
 const lightboxItem = ref<ClipItem | null>(null);
 const searchInput = ref<HTMLInputElement | null>(null);
-const imageCache = ref<Record<string, string>>({});
-const IMAGE_CACHE_LIMIT = 48;
-const IMAGE_PRELOAD_LIMIT = 32;
-const imageLoadInFlight = new Set<string>();
 let unlistenFns: UnlistenFn[] = [];
 const now = ref(Date.now());
 
@@ -330,64 +327,19 @@ function isSelected(item: ClipItem): boolean {
   return flatIndexed.value[selectedIndex.value]?.id === item.id;
 }
 
-function cachedImageKeepSet(limit = IMAGE_CACHE_LIMIT): Set<string> {
-  const keep = new Set<string>();
-  if (lightboxItem.value?.image_path) keep.add(lightboxItem.value.image_path);
-  if (ocrItem.value?.image_path) keep.add(ocrItem.value.image_path);
-
-  const selected = flatIndexed.value[selectedIndex.value];
-  if (selected?.image_path) keep.add(selected.image_path);
-
-  const prefetchLimit = miniMode.value ? 8 : limit;
-  for (const item of flatIndexed.value) {
-    if (item.image_path) keep.add(item.image_path);
-    if (keep.size >= prefetchLimit) break;
-  }
-  return keep;
+// 图片经 Tauri asset 协议直出(WebView 按需加载并自带缓存),列表优先用缩略图
+function imgSrc(item: ClipItem): string {
+  return convertFileSrc(item.thumb_path || item.image_path || "");
 }
-
-function pruneImageCache(extraKeep: string[] = []) {
-  const keep = cachedImageKeepSet();
-  for (const path of extraKeep) keep.add(path);
-  const next: Record<string, string> = {};
-  for (const path of keep) {
-    if (imageCache.value[path]) next[path] = imageCache.value[path];
-  }
-  imageCache.value = next;
+function imgFullSrc(item: ClipItem): string {
+  return convertFileSrc(item.image_path || "");
 }
-
-async function ensureImagePathCached(path: string) {
-  if (imageCache.value[path] || imageLoadInFlight.has(path)) return;
-  imageLoadInFlight.add(path);
-  try {
-    const dataUrl = await invoke<string>("read_image_as_data_url", { path });
-    imageCache.value = { ...imageCache.value, [path]: dataUrl };
-    pruneImageCache([path]);
-  } finally {
-    imageLoadInFlight.delete(path);
-  }
-}
-
-async function warmVisibleImageCache() {
-  pruneImageCache();
-  const keep = cachedImageKeepSet(IMAGE_PRELOAD_LIMIT);
-  for (const path of keep) {
-    try {
-      await ensureImagePathCached(path);
-    } catch { /* ignore */ }
-  }
-}
-
-watch([flatIndexed, miniMode, selectedIndex, lightboxItem, ocrItem], () => {
-  void warmVisibleImageCache();
-}, { flush: "post" });
 
 async function refresh() {
   items.value = await invoke<ClipItem[]>("get_items");
   if (selectedIndex.value >= flatIndexed.value.length) {
     selectedIndex.value = Math.max(0, flatIndexed.value.length - 1);
   }
-  await warmVisibleImageCache();
 }
 
 function timeMatches(ts: number, value: TimeFilter): boolean {
@@ -986,36 +938,22 @@ async function openQr(item: ClipItem) {
   }
 }
 
-async function ensureImageCached(item: ClipItem, silent = false) {
-  if (!item.image_path || imageCache.value[item.image_path]) return;
-  try {
-    await ensureImagePathCached(item.image_path);
-  } catch (e) {
-    if (!silent) throw e;
-  }
-}
-
 // OCR 文字识别：先弹窗确认，用户确认后再加入列表
-async function extractText(item: ClipItem) {
+function extractText(item: ClipItem) {
   if (item.content_type !== "image" || !item.image_path) {
     showToast("仅支持图片条目");
     return;
   }
-  try {
-    await ensureImageCached(item);
-    ocrItem.value = item;
-    ocrText.value = "";
-    ocrTool.value = "select";
-    ocrSelection.value = null;
-    ocrDragStart.value = null;
-    ocrPanStart.value = null;
-    ocrZoom.value = 1;
-    ocrBaseScale.value = 1;
-    ocrNaturalSize.value = { width: 0, height: 0 };
-    ocrMessage.value = "可拖动图片框选区域，或直接识别整图。";
-  } catch (e: any) {
-    showToast("图片加载失败: " + e);
-  }
+  ocrItem.value = item;
+  ocrText.value = "";
+  ocrTool.value = "select";
+  ocrSelection.value = null;
+  ocrDragStart.value = null;
+  ocrPanStart.value = null;
+  ocrZoom.value = 1;
+  ocrBaseScale.value = 1;
+  ocrNaturalSize.value = { width: 0, height: 0 };
+  ocrMessage.value = "可拖动图片框选区域，或直接识别整图。";
 }
 
 function closeOcrDialog() {
@@ -1715,7 +1653,6 @@ listen("tauri://focus", () => {
           :class="['item', { selected: isSelected(item), pinned: item.pinned, 'multi-on': selectedIds.has(item.id), 'dragging': draggedItemId === item.id, 'drop-target': dropTargetId === item.id }]"
           :draggable="filter === 'pinned' && item.pinned && !selectMode"
           @click="pickItem(item)"
-          @mouseenter="ensureImageCached(item, true)"
           @dragstart="onDragStart(item, $event)"
           @dragover="onDragOver(item, $event)"
           @dragleave="onDragLeave"
@@ -1738,8 +1675,8 @@ listen("tauri://focus", () => {
             </div>
             <div v-else class="image-line">
               <img
-                v-if="item.image_path && imageCache[item.image_path]"
-                :src="imageCache[item.image_path]"
+                v-if="item.image_path"
+                :src="imgSrc(item)"
                 class="thumb" alt=""
                 loading="lazy"
                 decoding="async"
@@ -1850,7 +1787,6 @@ listen("tauri://focus", () => {
             :key="item.id"
             :class="['item', { selected: isSelected(item), pinned: item.pinned, 'multi-on': selectedIds.has(item.id) }]"
             @click="pickItem(item)"
-            @mouseenter="ensureImageCached(item, true)"
           >
             <span v-if="!selectMode && quickIndex(item)" class="quick-no" :title="`Alt+${quickIndex(item)} 快速粘贴`">{{ quickIndex(item) }}</span>
             <span class="serial" aria-hidden="true">{{ serialOf(item) }}</span><span class="glyph" aria-hidden="true">{{ themedGlyph(item) }}</span>
@@ -1868,8 +1804,8 @@ listen("tauri://focus", () => {
               </div>
               <div v-else class="image-line">
                 <img
-                  v-if="item.image_path && imageCache[item.image_path]"
-                  :src="imageCache[item.image_path]"
+                  v-if="item.image_path"
+                  :src="imgSrc(item)"
                   class="thumb" alt=""
                   loading="lazy"
                   decoding="async"
@@ -1982,8 +1918,8 @@ listen("tauri://focus", () => {
     <!-- Lightbox -->
     <div v-if="lightboxItem" class="lightbox" @click="lightboxItem = null">
       <img
-        v-if="lightboxItem.image_path && imageCache[lightboxItem.image_path]"
-        :src="imageCache[lightboxItem.image_path]"
+        v-if="lightboxItem.image_path"
+        :src="imgFullSrc(lightboxItem)"
         class="lightbox-img"
         @click.stop
       />
@@ -2015,7 +1951,7 @@ listen("tauri://focus", () => {
               <button class="setting-btn" :disabled="ocrBusy" @click="zoomOcr(0.25)">放大</button>
             </div>
             <div
-              v-if="ocrItem.image_path && imageCache[ocrItem.image_path]"
+              v-if="ocrItem.image_path"
               ref="ocrViewport"
               class="ocr-image-viewport"
               @wheel="onOcrWheel"
@@ -2030,7 +1966,7 @@ listen("tauri://focus", () => {
               >
                 <img
                   ref="ocrImageEl"
-                  :src="imageCache[ocrItem.image_path]"
+                  :src="imgFullSrc(ocrItem)"
                   class="ocr-image"
                   draggable="false"
                   alt=""
