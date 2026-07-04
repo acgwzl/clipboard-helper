@@ -10,17 +10,14 @@ pick_item 与 paste_sequence 的图片哈希已改为解码后 RGBA(与轮询同
 ### 2. ~~老化清理泄漏图片文件~~ ✅ 已修复(c26050e,2026-07-04)
 `prune_old` 现在删行的同时 `fs::remove_file` 删 PNG;启动时 `cleanup_orphan_images` 清扫 images 目录中无 DB 记录引用的孤儿文件,自动回收旧版本泄漏的空间。
 
-### 3. 「全部」视图排序:拖拽排序过的收藏项永久霸占顶部 [已人工核实,刚提交 0aa2ba5 的边界情况]
-[lib.rs:234](../src-tauri/src/lib.rs#L234) `ORDER BY sort_order ASC NULLS LAST` 会把所有**有** sort_order 值的条目排在全部 NULL 条目之前;而 sort_order 只在收藏视图拖拽时写入、普通条目永远是 NULL、`toggle_pin` 取消收藏也不清除它。于是只要在收藏页拖过一次排序,这些条目就永远钉在「全部/文本/图片」顶部,与"按时间混排"的意图矛盾,还污染 Alt+1-9 序号和小窗前 5 条。
-**改法**:`query_all_items` 只按 `created_at DESC` 排;把 sort_order 返回给前端,仅收藏视图在前端按它排序;`toggle_pin` 取消收藏时 `UPDATE clips SET sort_order=NULL`。
+### 3. ~~「全部」视图排序:拖拽排序过的收藏项永久霸占顶部~~ ✅ 已修复(e19c999,2026-07-04)
+后端只按 created_at 排序,sort_order 随条目返回;前端仅收藏视图按 sort_order 排(拖拽定位同步改用显示顺序);toggle_pin/batch_pin 取消收藏时清除 sort_order。
 
-### 4. 启动时全局快捷键注册失败 → 应用直接崩溃
-[lib.rs:1655](../src-tauri/src/lib.rs#L1655) `register(...)?` 沿 `?` 传播到 [lib.rs:1879](../src-tauri/src/lib.rs#L1879) 的 `.expect()` panic 退出。Ctrl+Shift+V 是热门组合,被其它工具抢注时应用启动即消失:无窗口、无托盘、无提示。
-**改法**:`if let Err(e) = register(...)` 仅记录并继续启动,可回退尝试默认组合;失败状态记入 AppState,设置面板提示"快捷键被占用,请重新设置"。
+### 4. ~~启动时全局快捷键注册失败 → 应用直接崩溃~~ ✅ 已修复(e19c999,2026-07-04)
+注册失败只 eprintln 并继续启动(托盘/窗口正常可用),可进设置重设快捷键。可选增强:失败状态存 AppState 并在设置面板显式提示。
 
-### 5. 快捷键可录入无修饰键单键,保存后全系统吞键
-[App.vue:658](../src/App.vue#L658) `captureHotkey` 只排除纯修饰键本身,按字母 A 即得 `"A"`;后端 `parse_shortcut`(lib.rs:497-531)对空修饰键照样注册。之后系统任何地方按 "a" 都被本应用抢走,组合还持久化,普通用户难自救。
-**改法**:保存前校验必须含 Ctrl/Alt/Meta 之一(F1-F12 可例外);后端 `parse_shortcut` 同步兜底返回 Err。
+### 5. ~~快捷键可录入无修饰键单键,保存后全系统吞键~~ ✅ 已修复(e19c999,2026-07-04)
+前端 captureHotkey 与后端 parse_shortcut 双重校验:必须含 Ctrl/Alt/Win 之一,功能键 F1-F24 允许单独使用(Shift 单独不算,Shift+字母同样会吞大写输入)。
 
 ## P1 · 性能
 
