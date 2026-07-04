@@ -30,10 +30,8 @@ pick_item 与 paste_sequence 的图片哈希已改为解码后 RGBA(与轮询同
 ### 8. clips-changed 全量刷新 ⏳ 部分完成(0540b75:300ms 防抖 + 隐藏标脏、显示补刷)
 **剩余可选**:事件携带增量 payload 就地插入;SELECT 只传 `substr(text,1,500)` 预览 + 按需取全文(与 #9 一起做收益更大)。
 
-### 9. 列表渲染:每行十余个派生函数全量重算 + O(n²) 序号查找
-每行模板调 `highlightedParts`(每行重编译正则)、`looksJson`(全文 JSON.parse ×3 次/行)、`preview`(全文正则替换)等([App.vue:1646](../src/App.vue#L1646) 起);`quickIndex` 每行 `findIndex` 全表扫描([App.vue:571](../src/App.vue#L571)),200 条一次渲染 ≈ 6-12 万次比较;且每个按键/方向键/30s tick 都触发整列表重渲染。
-**改法**:派生元数据做成 `computed Map<id, meta>` 查表;正则用 computed 缓存单实例;序号用 v-for 的 index;行内容套 `v-memo`;最后一步可用已安装的 @vueuse/core `useVirtualList` 只渲染可视行。
-
+### 9. ~~列表渲染:每行十余个派生函数全量重算 + O(n²) 序号查找~~ ✅ 已修复(90f2230)
+列表行加 v-memo(导航/搜索/多选只重渲染受影响行);quickIndex 改 computed Map 查表 O(n);搜索正则缓存为 computed;looksJson 结果缓存;items 改 shallowRef。剩余可选:虚拟滚动(当前 200 条上限下收益有限)。
 ### 10. ~~OCR 阻塞 async runtime worker~~ ✅ 已修复(0540b75:整体挪入 spawn_blocking)
 
 ### 11. ~~多行写操作无事务、未开 WAL~~ ✅ 已修复(0540b75)
@@ -48,17 +46,12 @@ base64 加载路径整体删除,图片由 WebView 经 asset 协议按需加载�
 
 ### 14. ~~自动粘贴:固定 120ms 赌焦点 + 物理 Shift 未松开会触发自家全局热键~~ ✅ 已修复(c9d7693)
 simulate_paste 前用 GetAsyncKeyState 轮询等 Ctrl/Shift/Alt/Win 全部物理松开(超时 1.5s)再发 Ctrl+V。
-### 15. 轮询任务锁中毒即静默死亡;insert 失败内容无声丢失
-轮询内 6 处 `.lock().unwrap()`([lib.rs:1769](../src-tauri/src/lib.rs#L1769) 起),任何命令线程持锁 panic 后下一 tick 轮询 panic 且不重启——捕获从此停摆无日志。且先更新 last_hash 再 `let _ = insert_text(...)`,失败既不入库也不重试。
-**改法**:`lock().unwrap_or_else(|p| p.into_inner())` 或换 parking_lot;insert 成功后才更新 last_hash;循环体隔离单 tick 失败。
-
+### 15. ~~轮询任务锁中毒即静默死亡;insert 失败内容无声丢失~~ ✅ 已修复(90f2230)
+轮询/托盘/补缩略图统一 `lock_ok`(中毒时 into_inner 继续);落库成功后才更新 last_hash。
 ### 16. ~~托盘「清空未收藏历史」零确认~~ ✅ 已修复(c9d7693:plugin-dialog 原生警告确认,独立线程 blocking_show)
 ### 17. ~~小窗模式下所有 toast 不可见~~ ✅ 已修复(c9d7693:toast 拆为固定定位浮层挂 .app 根部,与 dragDebug 分离)
 ### 18. ~~破坏性操作用原生 confirm()/alert()~~ ✅ 已修复(c9d7693:应用内确认框 askConfirm(Enter 确定/Esc 取消)+ 全局 toast,6 处原生弹窗全部替换)
-### 19. 正则搜索语义不对称
-正则模式只搜文本条目正文([App.vue:211](../src/App.vue#L211)),图片连标签都搜不到;普通模式搜 text+tags。切换开关结果集突变。
-**改法**:正则复用相同 haystack(`text + tags`),去掉 content_type 过滤。
-
+### 19. ~~正则搜索语义不对称~~ ✅ 已修复(90f2230:正则与普通搜索同 haystack(正文+标签),图片条目可按标签搜到)
 ### 20. 导出不带图片、导入产生共享文件的多行,删除互相误伤
 export 只写含绝对路径的 JSON;import 时路径存在才收、且直接引用原文件不复制([lib.rs:1346](../src-tauri/src/lib.rs#L1346))——重复导入产生多行指向同一 PNG,`delete_item` 又会物理删文件,删一条把别条的图也删没。
 **改法**:导出 zip(data.json + images/)或内嵌 base64 选项;导入把图片复制进 images_dir 换新 uuid,按内容哈希去重。
@@ -74,11 +67,7 @@ export 只写含绝对路径的 JSON;import 时路径存在才收、且直接引
 
 ### 23. ~~死依赖清理~~ ✅ 已完成(c9d7693)
 npm 移除 @vueuse/core、@tauri-apps/plugin-clipboard-manager、@tauri-apps/plugin-global-shortcut;Cargo 移除 window-vibrancy,tokio 特性 full→time。
-### 24. 杂项修正 ⏳ 部分完成(c9d7693:mobile_entry_point 归位 / 文件头注释修正 / get_has_mica 已移除)
-- ~~mobile_entry_point 属性错位~~ ✅;~~文件头"毛玻璃窗口"过时注释~~ ✅;~~get_has_mica 恒 false~~ ✅ 已连同 AppState.has_mica 移除;
-- `filtered` computed 里写 `searchError`(副作用)→ 拆独立 computed;
-- `tauri://focus` 监听未收集 unlisten,HMR 时叠加重复处理器;
-- `items` 可改 `shallowRef`,省 200 对象深代理开销。
-
+### 24. ~~杂项修正~~ ✅ 已全部完成(c9d7693 + 90f2230)
+mobile_entry_point 归位 / 文件头注释 / get_has_mica 移除 / searchError 拆独立 computed / tauri://focus 收集 unlisten / items 改 shallowRef。
 ### 25. (可选)App.vue 拆分
 3789 行单文件目前尚可维护,若继续加功能建议按痛点渐进拆:先抽 OCR 弹窗(约 400 行,最独立)、设置弹窗、ClipRow 行组件(配合 #9 的 v-memo),逻辑侧抽 useClipboardList / useKeyboardNav 两个 composable。不为拆而拆。
