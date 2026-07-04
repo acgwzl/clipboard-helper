@@ -21,6 +21,7 @@ interface ClipItem {
   image_bytes: number | null;
   sort_order: number | null;
   thumb_path: string | null;
+  image_data?: string; // 仅导出/导入传输用
 }
 
 interface Stats {
@@ -728,6 +729,21 @@ async function saveHotkey() {
     hotkeyEditing.value = false;
   } catch (e: any) {
     hotkeyError.value = "无效组合: " + e;
+  }
+}
+
+// 开机自启
+const autostartOn = ref(false);
+async function loadAutostart() {
+  try { autostartOn.value = await invoke<boolean>("get_autostart"); } catch { autostartOn.value = false; }
+}
+async function toggleAutostart() {
+  try {
+    await invoke("set_autostart", { enable: !autostartOn.value });
+    autostartOn.value = !autostartOn.value;
+    showToast(autostartOn.value ? "已开启开机自启" : "已关闭开机自启");
+  } catch (e: any) {
+    showToast("设置失败: " + e);
   }
 }
 
@@ -1560,7 +1576,7 @@ void listen("tauri://focus", () => {
 
         <button class="topbtn" @click="openSnippetEditor()" title="创建可复用片段"><svg class="ic"><use href="#i-star"/></svg>片段</button>
         <button class="topbtn icon" @click="helpOpen = true" title="帮助"><svg class="ic"><use href="#i-help"/></svg></button>
-        <button class="topbtn icon" @click="loadPrivacyStatus(); settingsOpen = true" title="设置"><svg class="ic"><use href="#i-gear"/></svg></button>
+        <button class="topbtn icon" @click="loadPrivacyStatus(); loadAutostart(); settingsOpen = true" title="设置"><svg class="ic"><use href="#i-gear"/></svg></button>
         <button class="topbtn" @click="importAll()"><svg class="ic"><use href="#i-down"/></svg>导入</button>
         <button class="topbtn" @click="exportAll()"><svg class="ic"><use href="#i-up"/></svg>导出</button>
         <button class="topbtn mini-toggle-btn" :class="{ active: miniMode }" @click="toggleMiniMode">{{ miniMode ? '完整' : '小窗' }}</button>
@@ -2110,6 +2126,15 @@ void listen("tauri://focus", () => {
             </div>
             <div v-if="hotkeyError" class="setting-error">{{ hotkeyError }}</div>
             <div class="setting-help">点击「修改」后按下组合键。例如 Ctrl+Shift+V</div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">开机自启</div>
+            <div class="setting-control">
+              <button class="toggle" @click="toggleAutostart">
+                <span>随系统启动,静默驻留托盘</span>
+                <span class="switch" :class="{ on: autostartOn }" aria-hidden="true"></span>
+              </button>
+            </div>
           </div>
           <div class="setting-row">
             <div class="setting-label">隐私模式</div>

@@ -58,6 +58,9 @@ pub struct ClipItem {
     pub sort_order: Option<i64>,
     #[serde(default)]
     pub thumb_path: Option<String>,
+    /// 仅用于导出/导入的传输字段(PNG 文件的 base64),不入库
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_data: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -159,6 +162,11 @@ fn init_db(db_path: &PathBuf) -> rusqlite::Result<Connection> {
     ensure_column(&conn, "clips", "tags", "TEXT NOT NULL DEFAULT '[]'")?;
     ensure_column(&conn, "clips", "sort_order", "INTEGER")?; // nullable,手动排序用
     ensure_column(&conn, "clips", "thumb_path", "TEXT")?; // 列表缩略图(最长边 320px)
+    ensure_column(&conn, "clips", "image_hash", "TEXT")?; // 解码后 RGBA 的 md5,图片内容级去重
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_clips_image_hash ON clips(image_hash)",
+        [],
+    );
     ensure_column(&conn, "clips", "image_width", "INTEGER")?;
     ensure_column(&conn, "clips", "image_height", "INTEGER")?;
     ensure_column(&conn, "clips", "image_bytes", "INTEGER")?;
@@ -235,6 +243,7 @@ fn row_to_item(row: &rusqlite::Row) -> rusqlite::Result<ClipItem> {
         image_bytes: row.get::<_, Option<i64>>(10).ok().flatten(),
         sort_order: row.get::<_, Option<i64>>(11).ok().flatten(),
         thumb_path: row.get::<_, Option<String>>(12).ok().flatten(),
+        image_data: None,
     })
 }
 
@@ -273,14 +282,15 @@ fn insert_image(
     conn: &Connection,
     path: &str,
     thumb_path: Option<&str>,
+    image_hash: Option<&str>,
     width: u32,
     height: u32,
     bytes: i64,
 ) -> rusqlite::Result<i64> {
     conn.execute(
-        "INSERT INTO clips (content_type, text, image_path, thumb_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes) \
-         VALUES ('image', NULL, ?1, ?2, 0, ?3, 0, '[]', ?4, ?5, ?6)",
-        params![path, thumb_path, Utc::now().timestamp_millis(), width as i64, height as i64, bytes],
+        "INSERT INTO clips (content_type, text, image_path, thumb_path, image_hash, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes) \
+         VALUES ('image', NULL, ?1, ?2, ?3, 0, ?4, 0, '[]', ?5, ?6, ?7)",
+        params![path, thumb_path, image_hash, Utc::now().timestamp_millis(), width as i64, height as i64, bytes],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -379,6 +389,14 @@ fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// 图片内容指纹:解码后 RGBA 像素的 md5(与文件编码格式无关)
+fn md5_hex(data: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
 fn toggle_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         if win.is_visible().unwrap_or(false) {
@@ -408,10 +426,11 @@ fn make_thumbnail(src_path: &str) -> Option<String> {
 fn save_clipboard_image(
     raw: &tauri::image::Image<'_>,
     images_dir: &PathBuf,
-) -> Result<(String, Option<String>, u32, u32, i64), String> {
+) -> Result<(String, Option<String>, String, u32, u32, i64), String> {
     use image::{ImageBuffer, Rgba};
     let width = raw.width();
     let height = raw.height();
+    let content_hash = md5_hex(raw.rgba());
     let rgba: ImageBuffer<Rgba<u8>, Vec<u8>> =
         ImageBuffer::from_raw(width, height, raw.rgba().to_vec())
             .ok_or_else(|| "raw image size mismatch".to_string())?;
@@ -423,7 +442,7 @@ fn save_clipboard_image(
     let bytes = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
     let path_str = path.to_string_lossy().to_string();
     let thumb = make_thumbnail(&path_str);
-    Ok((path_str, thumb, width, height, bytes))
+    Ok((path_str, thumb, content_hash, width, height, bytes))
 }
 
 fn load_image_for_clipboard(
@@ -1194,11 +1213,28 @@ fn add_file_path(path: String, state: State<'_, AppState>) -> Result<(), String>
     );
 
     if is_image {
-        // 转码为 PNG 存到 images_dir
+        // 转码为 PNG 存到 images_dir(按内容去重:同像素仅刷新时间)
         let img = image::open(&path).map_err(|e| e.to_string())?;
         let width = img.width();
         let height = img.height();
         let rgba = img.to_rgba8();
+        let content_hash = md5_hex(rgba.as_raw());
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM clips WHERE image_hash = ?1",
+                params![content_hash],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(id) = existing {
+            let _ = conn.execute(
+                "UPDATE clips SET created_at = ?1 WHERE id = ?2",
+                params![Utc::now().timestamp_millis(), id],
+            );
+            return Ok(());
+        }
+        drop(conn);
         let filename = format!("{}.png", uuid::Uuid::new_v4());
         let dest = state.images_dir.join(&filename);
         rgba.save_with_format(&dest, image::ImageFormat::Png)
@@ -1207,7 +1243,7 @@ fn add_file_path(path: String, state: State<'_, AppState>) -> Result<(), String>
         let dest_str = dest.to_string_lossy().to_string();
         let thumb = make_thumbnail(&dest_str);
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        let _ = insert_image(&conn, &dest_str, thumb.as_deref(), width, height, bytes);
+        let _ = insert_image(&conn, &dest_str, thumb.as_deref(), Some(&content_hash), width, height, bytes);
         let _ = prune_old(&conn);
         Ok(())
     } else if is_text {
@@ -1223,6 +1259,25 @@ fn add_file_path(path: String, state: State<'_, AppState>) -> Result<(), String>
     } else {
         // 其它文件：把路径作为文本存
         add_text(format!("[文件] {}", path), state)
+    }
+}
+
+// ---------- 开机自启 ----------
+
+#[tauri::command]
+fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_autostart(enable: bool, app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    if enable {
+        autolaunch.enable().map_err(|e| e.to_string())
+    } else {
+        autolaunch.disable().map_err(|e| e.to_string())
     }
 }
 
@@ -1407,18 +1462,29 @@ fn replace_text(id: i64, new_text: String, state: State<'_, AppState>) -> Result
 
 #[tauri::command]
 fn export_history(path: String, state: State<'_, AppState>) -> Result<i64, String> {
-    let items = {
+    let mut items = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         query_all_items(&conn).map_err(|e| e.to_string())?
     };
+    // 图片内嵌 base64,导出文件自包含,跨机导入不丢图
+    for it in items.iter_mut() {
+        if it.content_type == "image" {
+            if let Some(p) = &it.image_path {
+                if let Ok(bytes) = std::fs::read(p) {
+                    it.image_data = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+                }
+            }
+        }
+    }
+    let count = items.len() as i64;
     let payload = ExportPayload {
-        version: 1,
+        version: 2,
         exported_at: Utc::now().timestamp_millis(),
-        items: items.clone(),
+        items,
     };
     let json = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
-    Ok(items.len() as i64)
+    Ok(count)
 }
 
 #[tauri::command]
@@ -1457,26 +1523,54 @@ fn import_history(path: String, state: State<'_, AppState>) -> Result<i64, Strin
                 }
             }
             "image" => {
-                // 图片只导入仍存在于磁盘的路径
-                if let Some(p) = &it.image_path {
-                    if std::path::Path::new(p).exists() {
-                        tx.execute(
-                            "INSERT INTO clips (content_type, text, image_path, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes) \
-                             VALUES ('image', NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                            params![
-                                p,
-                                if it.pinned { 1 } else { 0 },
-                                it.created_at,
-                                it.copy_count,
-                                serde_json::to_string(&normalize_tags(it.tags.clone())).unwrap_or_else(|_| "[]".to_string()),
-                                it.image_width.map(|v| v as i64),
-                                it.image_height.map(|v| v as i64),
-                                it.image_bytes
-                            ],
-                        ).map_err(|e| e.to_string())?;
-                        imported += 1;
-                    }
+                // v2 优先内嵌数据,v1 回退磁盘路径;两者都复制成本库新文件并按内容去重,
+                // 不再直接引用外部路径(旧行为会让多行共享同一文件,删除互相误伤)
+                let bytes: Option<Vec<u8>> = if let Some(data) = &it.image_data {
+                    base64::engine::general_purpose::STANDARD.decode(data).ok()
+                } else if let Some(p) = &it.image_path {
+                    std::fs::read(p).ok()
+                } else {
+                    None
+                };
+                let Some(bytes) = bytes else { continue };
+                let Ok(img) = image::load_from_memory(&bytes) else { continue };
+                let rgba = img.to_rgba8();
+                let content_hash = md5_hex(rgba.as_raw());
+                let exists: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM clips WHERE image_hash = ?1",
+                        params![content_hash],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if exists.is_some() {
+                    continue;
                 }
+                let filename = format!("{}.png", uuid::Uuid::new_v4());
+                let dest = state.images_dir.join(&filename);
+                if rgba.save_with_format(&dest, image::ImageFormat::Png).is_err() {
+                    continue;
+                }
+                let size = std::fs::metadata(&dest).map(|m| m.len() as i64).unwrap_or(0);
+                let dest_str = dest.to_string_lossy().to_string();
+                let thumb = make_thumbnail(&dest_str);
+                tx.execute(
+                    "INSERT INTO clips (content_type, text, image_path, thumb_path, image_hash, pinned, created_at, copy_count, tags, image_width, image_height, image_bytes) \
+                     VALUES ('image', NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        dest_str,
+                        thumb,
+                        content_hash,
+                        if it.pinned { 1 } else { 0 },
+                        it.created_at,
+                        it.copy_count,
+                        serde_json::to_string(&normalize_tags(it.tags.clone())).unwrap_or_else(|_| "[]".to_string()),
+                        rgba.width() as i64,
+                        rgba.height() as i64,
+                        size
+                    ],
+                ).map_err(|e| e.to_string())?;
+                imported += 1;
             }
             _ => {}
         }
@@ -1728,6 +1822,10 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             let app_data_dir = app
                 .path()
@@ -2015,20 +2113,41 @@ pub fn run() {
                     if let Ok(img) = clipboard.read_image() {
                         let h = hash_bytes(img.rgba());
                         if *lock_ok(&state.last_hash) != h {
-                            match save_clipboard_image(&img, &state.images_dir) {
-                                Ok((path, thumb, width, height, bytes)) => {
-                                    let inserted = {
+                            // 图片内容级去重:同像素只保留一条,重复复制仅刷新时间
+                            let content_hash = md5_hex(img.rgba());
+                            let existing: Option<i64> = {
+                                let conn = lock_ok(&state.db);
+                                conn.query_row(
+                                    "SELECT id FROM clips WHERE image_hash = ?1",
+                                    params![content_hash],
+                                    |r| r.get(0),
+                                )
+                                .ok()
+                            };
+                            let ok = if let Some(id) = existing {
+                                let conn = lock_ok(&state.db);
+                                conn.execute(
+                                    "UPDATE clips SET created_at = ?1 WHERE id = ?2",
+                                    params![Utc::now().timestamp_millis(), id],
+                                )
+                                .is_ok()
+                            } else {
+                                match save_clipboard_image(&img, &state.images_dir) {
+                                    Ok((path, thumb, hash, width, height, bytes)) => {
                                         let conn = lock_ok(&state.db);
-                                        let r = insert_image(&conn, &path, thumb.as_deref(), width, height, bytes).is_ok();
+                                        let r = insert_image(&conn, &path, thumb.as_deref(), Some(&hash), width, height, bytes).is_ok();
                                         let _ = prune_old(&conn);
                                         r
-                                    };
-                                    if inserted {
-                                        *lock_ok(&state.last_hash) = h;
-                                        let _ = poll_handle.emit("clips-changed", ());
+                                    }
+                                    Err(e) => {
+                                        eprintln!("save image failed: {}", e);
+                                        false
                                     }
                                 }
-                                Err(e) => eprintln!("save image failed: {}", e),
+                            };
+                            if ok {
+                                *lock_ok(&state.last_hash) = h;
+                                let _ = poll_handle.emit("clips-changed", ());
                             }
                         }
                     }
@@ -2063,6 +2182,8 @@ pub fn run() {
             add_file_path,
             get_hotkey,
             set_hotkey,
+            get_autostart,
+            set_autostart,
             transform_text,
             replace_text,
             extract_text_from_image,
