@@ -1826,13 +1826,13 @@ void listen("tauri://focus", () => {
               title="勾选"
             ><svg class="ic"><use :href="selectedIds.has(item.id) ? '#i-check' : '#i-circle'"/></svg></button>
             <button
-              v-if="item.content_type === 'text' && !miniMode"
+              v-if="item.content_type === 'text'"
               class="iconbtn"
               @click.stop="copyPlain(item)"
               title="复制纯文本"
             >文</button>
             <button
-              v-if="detectUrl(item.text) && !miniMode"
+              v-if="detectUrl(item.text)"
               class="iconbtn"
               @click.stop="openItemUrl(item)"
               title="打开链接"
@@ -1862,13 +1862,13 @@ void listen("tauri://focus", () => {
               title="在文件夹中显示"
             >夹</button>
             <button
-              v-if="item.content_type === 'text' && item.text && !miniMode"
+              v-if="item.content_type === 'text' && item.text"
               class="iconbtn qr-btn"
               @click.stop="openQr(item)"
               title="生成二维码"
             ><svg class="ic"><use href="#i-qr"/></svg></button>
             <button
-              v-if="item.content_type === 'image' && !miniMode"
+              v-if="item.content_type === 'image'"
               class="iconbtn ocr-btn"
               @click.stop="extractText(item)"
               title="识别图片文字 (OCR)"
