@@ -2471,8 +2471,8 @@ void listen("tauri://focus", () => {
   --panel-soft: #efe7d2;
   --panel-2: #f4edda;
   --text: #2c4460;
-  --text-secondary: #5c7186;
-  --text-tertiary: #8fa0b0;
+  --text-secondary: #52687e;
+  --text-tertiary: #69809a;
   --border: rgba(44,68,96,.30);
   --border-strong: rgba(44,68,96,.55);
   --accent: #c14a2e;
@@ -2495,8 +2495,8 @@ void listen("tauri://focus", () => {
   --panel-soft: #253243;
   --panel-2: #1a2330;
   --text: #e7dfca;
-  --text-secondary: #b4ad97;
-  --text-tertiary: #74809a;
+  --text-secondary: #beb69f;
+  --text-tertiary: #8b98ae;
   --border: rgba(231,223,202,.14);
   --border-strong: rgba(231,223,202,.32);
   --accent: #e06a4a;
@@ -3794,6 +3794,8 @@ h1 {
   transform: rotate(-3deg);
 }
 .item.pinned .glyph { border-color: var(--accent); color: var(--accent); border-radius: 50%; }
+/* hover/选中时基础规则会把章底染成朱砂实底,收藏章的字必须换成米色,否则红底红字不可见 */
+.item.pinned:hover .glyph, .item.pinned.selected .glyph { color: var(--accent-ink); }
 
 /* 分组头 = 抽屉标签 */
 .group-head::before { display: none; }
