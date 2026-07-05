@@ -820,9 +820,8 @@ function serialOf(item: ClipItem): string {
   return String(item.id % 10000).padStart(4, "0");
 }
 
-// 条目"类型章":档案语言的汉字铅字(收藏=藏)
+// 条目"类型章":档案语言的汉字铅字(收藏态由蜡封★与红圈表达,不占用类型位)
 function themedGlyph(item: ClipItem): string {
-  if (item.pinned) return "藏";
   if (item.content_type === "image") return "图";
   if (detectUrl(item.text)) return "链";
   if (detectEmail(item.text)) return "邮";
@@ -3078,9 +3077,9 @@ h1 {
 }
 .item-preview .hit {
   background: var(--accent-soft);
-  color: var(--accent);
+  color: inherit;
+  font-weight: 600;
   border-radius: 3px;
-  box-shadow: 0 0 0 1px var(--accent-soft);
 }
 .item-tags {
   display: flex; flex-wrap: wrap; gap: 4px;
@@ -3227,6 +3226,7 @@ h1 {
   width: 24px;
   height: 24px;
   font-size: 11px;
+  transform: none; /* 小字号下取消印章倾斜,旋转抗锯齿会让字发虚 */
 }
 .mini-mode .item-title {
   margin-bottom: 2px;
