@@ -3052,7 +3052,7 @@ h1 {
 .item-title {
   display: flex; align-items: center; gap: 8px;
   font-family: var(--font-mono);
-  font-size: 10px; letter-spacing: .04em; text-transform: uppercase;
+  font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
   color: var(--text-tertiary); margin-bottom: 3px;
 }
 .detail-label {
@@ -3136,7 +3136,7 @@ h1 {
 
 .meta {
   display: flex; gap: 6px; margin-top: 4px;
-  font-size: 11px; color: var(--text-tertiary); letter-spacing: 0;
+  font-size: 11px; font-weight: 600; color: var(--text-tertiary); letter-spacing: 0;
 }
 .mini-mode .meta {
   margin-top: 2px;
